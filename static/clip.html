@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>网络剪贴板 · 点对点直连</title>
+<style>
+  :root{
+    --bg:#f5f7fa; --card:#fff; --border:#e5e7eb; --text:#1f2937; --muted:#6b7280;
+    --primary:#2563eb; --primary-dark:#1d4ed8; --danger:#dc2626; --ok:#16a34a;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;
+    background:var(--bg);color:var(--text);padding:4px;line-height:1.5}
+  .wrap{max-width:1400px;margin:0 auto}
+  header{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin:2px 0 6px}
+  h1{font-size:19px;font-weight:600;white-space:nowrap}
+  .sub{color:var(--muted);font-size:12px}
+  .hd-meta{flex:1 1 320px;min-width:0}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:6px;padding:8px 10px;margin-bottom:7px}
+  .link-btn{font-size:12px;color:var(--primary);text-decoration:none;border:1px solid var(--border);
+    padding:4px 9px;border-radius:5px;background:#fff}
+  .link-btn:hover{background:#eff6ff;border-color:var(--primary)}
+  button{padding:5px 10px;border:none;border-radius:5px;font-size:12.5px;font-weight:500;cursor:pointer;
+    font-family:inherit;transition:.15s;height:29px;white-space:nowrap}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  .btn-primary{background:var(--primary);color:#fff}
+  .btn-primary:hover:not(:disabled){background:var(--primary-dark)}
+  .btn-ghost{background:#fff;color:var(--text);border:1px solid var(--border)}
+  .btn-ghost:hover:not(:disabled){background:#f9fafb;border-color:#cbd5e1}
+  .btn-danger{background:#fff;color:var(--danger);border:1px solid #fecaca}
+  .btn-danger:hover{background:#fef2f2}
+  input[type=text],input[type=password],select,textarea.field{
+    padding:4px 7px;border:1px solid var(--border);border-radius:5px;font-size:12.5px;
+    font-family:inherit;height:29px;background:#fff;color:var(--text);min-width:0}
+  input:focus,select:focus,textarea:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 2px rgba(37,99,235,.1)}
+  label{font-size:12px;color:var(--muted);font-weight:500}
+
+  .roombar{display:flex;flex-wrap:wrap;gap:7px;align-items:center}
+  .idbox{display:flex;align-items:center;gap:3px}
+  .idbox .hash{font-family:ui-monospace,Consolas,monospace;color:var(--muted);font-size:13px}
+  #roomId{font-family:ui-monospace,Consolas,monospace;width:130px;font-weight:600;color:var(--primary)}
+  .urlbox{flex:1 1 320px;display:flex;gap:4px;min-width:0}
+  #shareUrl{flex:1;width:100%;background:#f9fafb;font-family:ui-monospace,Consolas,monospace;color:var(--muted)}
+  .dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#9ca3af;margin-right:4px;vertical-align:1px}
+  .dot.on{background:var(--ok);box-shadow:0 0 0 3px rgba(22,163,74,.12)}
+  .conn{font-size:11.5px;color:var(--muted);white-space:nowrap}
+
+  .layout{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(300px,1fr);gap:7px}
+  @media(max-width:900px){.layout{grid-template-columns:1fr}}
+  .pane{margin-bottom:0;display:flex;flex-direction:column;min-height:420px}
+  .pane-title{display:flex;align-items:center;gap:7px;margin-bottom:6px;flex-wrap:wrap}
+  .pane-title h2{font-size:14px;font-weight:600}
+  .spacer{flex:1}
+  .count{font-size:11.5px;color:var(--muted);font-variant-numeric:tabular-nums}
+  textarea#text{width:100%;flex:1;min-height:280px;resize:vertical;border:1px solid var(--border);border-radius:5px;
+    padding:8px;font-size:13px;line-height:1.55;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;color:var(--text)}
+  textarea#text:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 2px rgba(37,99,235,.1)}
+  .bar{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:6px}
+  .status{font-size:11.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .status.saved{color:var(--ok)}
+  .status.err{color:var(--danger)}
+  .drop{border:1px dashed #cbd5e1;border-radius:6px;background:#fafbfc;padding:16px 10px;text-align:center;
+    cursor:pointer;transition:.15s;color:var(--muted);font-size:12.5px}
+  .drop:hover,.drop.over{border-color:var(--primary);background:#eff6ff;color:var(--primary)}
+  .drop b{color:var(--primary);font-weight:600}
+  .files{margin-top:6px;overflow:auto;max-height:330px}
+  .file{display:flex;align-items:center;gap:7px;padding:5px 4px;border-bottom:1px solid #f1f5f9;font-size:12.5px}
+  .file:last-child{border-bottom:none}
+  .file .icon{width:24px;height:24px;border-radius:5px;background:#eff6ff;color:var(--primary);
+    display:flex;align-items:center;justify-content:center;font-size:10px;flex:none}
+  .file .meta{flex:1;min-width:0}
+  .file .name{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block}
+  .file .info{color:var(--muted);font-size:11px}
+  .file a,.file button{height:25px;padding:2px 7px;font-size:11.5px;line-height:20px}
+  .empty{text-align:center;color:#9ca3af;font-size:12px;padding:16px 0}
+
+  .tips{font-size:11.5px;color:var(--muted);padding:2px 4px 12px;line-height:1.7}
+  .tips b{color:var(--text)}
+  .msg{position:fixed;top:10px;left:50%;transform:translateX(-50%);z-index:60;pointer-events:none}
+  .toast{background:#1f2937;color:#fff;padding:7px 14px;border-radius:6px;font-size:12.5px;
+    box-shadow:0 4px 16px rgba(0,0,0,.18);margin-bottom:5px;animation:fade .2s}
+  .toast.err{background:var(--danger)}
+  @keyframes fade{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:none}}
+
+  .modal{position:fixed;inset:0;background:rgba(15,23,42,.45);display:flex;align-items:center;
+    justify-content:center;z-index:50;padding:12px}
+  .modal.hidden{display:none}
+  .dialog{background:#fff;border-radius:9px;padding:16px 18px;width:min(620px,100%);box-shadow:0 12px 40px rgba(0,0,0,.2)}
+  .dialog h3{font-size:15px;font-weight:600;margin-bottom:10px}
+  .dialog .field{display:flex;flex-direction:column;gap:4px;margin-bottom:9px}
+  .dialog textarea.field{height:88px;resize:vertical;font-family:ui-monospace,Consolas,monospace;font-size:11px;line-height:1.45}
+  .actions{display:flex;justify-content:flex-end;gap:6px;margin-top:10px;flex-wrap:wrap}
+  .hint{font-size:11px;color:var(--muted);line-height:1.65;margin-bottom:10px}
+  .steps{font-size:11.5px;color:var(--text);line-height:1.75;background:#f8fafc;border:1px solid #e2e8f0;
+    border-radius:5px;padding:7px 10px;margin-bottom:10px}
+  #qrImg{display:block;margin:4px auto 10px;width:210px;height:210px;image-rendering:pixelated}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>网络剪贴板</h1>
+    <div class="hd-meta"><span class="sub">浏览器之间点对点直传 · 服务端只交换连接信息，不保存任何内容</span></div>
+    <a class="link-btn" href="/" target="_self">返回 IP 扫描</a>
+  </header>
+
+  <div id="msg" class="msg"></div>
+
+  <div class="card roombar">
+    <span class="idbox"><span class="hash">#</span><input type="text" id="roomId" readonly title="连接标识"></span>
+    <div class="urlbox"><input type="text" id="shareUrl" readonly><button class="btn-ghost" id="copyUrl">复制给对端</button></div>
+    <button class="btn-ghost" id="qrBtn">二维码</button>
+    <button class="btn-ghost" id="manualBtn">手动配对（无需服务端）</button>
+    <button class="btn-ghost" id="newBtn">换一个地址</button>
+    <span class="conn"><i class="dot" id="dot"></i><span id="connText">准备中</span></span>
+  </div>
+
+  <div class="layout">
+    <section class="card pane">
+      <div class="pane-title">
+        <h2>文本内容</h2>
+        <span class="count" id="textCount">0 字节</span>
+        <span class="spacer"></span>
+        <button class="btn-ghost" id="pasteBtn">从剪贴板粘贴</button>
+        <button class="btn-ghost" id="copyBtn">复制内容</button>
+        <button class="btn-ghost" id="clearBtn">清空</button>
+      </div>
+      <textarea id="text" spellcheck="false" placeholder="输入或粘贴文本，内容只保存在本浏览器；建立直连后自动同步到对端…"></textarea>
+      <div class="bar">
+        <span class="status" id="saveStatus">等待连接</span>
+        <span class="spacer"></span>
+        <span class="status" id="infoText">端到端直连 · 无服务器留存</span>
+      </div>
+    </section>
+
+    <section class="card pane">
+      <div class="pane-title">
+        <h2>文件传输</h2>
+        <span class="count" id="fileCount">0 个文件</span>
+      </div>
+      <div class="drop" id="drop">拖拽文件到这里，或 <b>点击选择文件</b><br>
+        <span style="font-size:11px">文件切片后直传对端浏览器，不经服务端；本端内存中暂存的 Blob 可重复发送</span></div>
+      <input type="file" id="fileInput" multiple hidden>
+      <div class="files" id="files"><div class="empty">暂无文件</div></div>
+    </section>
+  </div>
+
+  <div class="tips">
+    <b>用法：</b>把「复制给对端」的地址发到另一台设备（或扫码），两端通过服务端交换一次连接信息后即建立 WebRTC 直连；
+    之后关闭服务端，已打开的两个页面仍可继续同步文本与传文件。<br>
+    <b>无需服务端：</b>点击「手动配对」，把本端描述复制给对端、再把对端描述粘贴回来即可直连，全程不需要服务端在线。<br>
+    <b>隐私：</b>文本与文件都不经过服务端，也不落盘；刷新页面后本机暂存的文件即消失，请勿用作长期存储。
+  </div>
+</div>
+
+<div class="modal hidden" id="manualModal">
+  <div class="dialog">
+    <h3>手动配对（无需服务端）</h3>
+    <div class="steps">
+      1. 一端点「生成邀请码」，复制本端描述发给对端（任意方式：微信/U 盘/手输）。<br>
+      2. 对端把邀请码粘贴到「对端描述」，点「生成应答」，把应答复制回第一端。<br>
+      3. 第一端把应答粘贴到「对端描述」，点「应用应答」，随后自动直连。
+    </div>
+    <div class="field"><label>本端描述（复制给对端）</label><textarea class="field" id="mLocal" readonly></textarea></div>
+    <div class="field"><label>对端描述（粘贴对端发来的内容）</label><textarea class="field" id="mRemote" placeholder='{"type":"offer","sdp":"..."}'></textarea></div>
+    <div class="actions">
+      <button class="btn-ghost" id="mCopy">复制本端描述</button>
+      <button class="btn-ghost" id="mOffer">生成邀请码</button>
+      <button class="btn-ghost" id="mAnswer">生成应答</button>
+      <button class="btn-primary" id="mApply">应用应答</button>
+      <button class="btn-ghost" id="mClose">关闭</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal hidden" id="qrModal">
+  <div class="dialog" style="text-align:center;width:min(360px,100%)">
+    <h3>扫码加入</h3>
+    <img id="qrImg" alt="二维码">
+    <div class="field"><input type="text" id="qrUrl" readonly></div>
+    <div class="actions"><button class="btn-ghost" id="qrCopy">复制地址</button><button class="btn-primary" id="qrClose">关闭</button></div>
+  </div>
+</div>
+
+<script>
+(function(){
+  'use strict';
+  const $ = id => document.getElementById(id);
+  const ta = $('text');
+  const CHUNK = 16384;
+  const st = {id:'', role:'host', pc:null, dc:null, connected:false,
+              text:'', textTs:0, files:new Map(), incoming:new Map(), pollTimer:null};
+
+  function randomId(){ const a=new Uint8Array(5); crypto.getRandomValues(a);
+    return Array.from(a,b=>b.toString(16).padStart(2,'0')).join(''); }
+  function validId(id){ return /^[A-Za-z0-9_-]{3,32}$/.test(id||''); }
+  function toHex(bytes){ return Array.from(bytes,b=>b.toString(16).padStart(2,'0')).join(''); }
+  function fromHex(s){ const a=new Uint8Array(s.length/2); for(let i=0;i<a.length;i++) a[i]=parseInt(s.substr(i*2,2),16); return a; }
+  function esc(s){ return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+  function fmtSize(n){ if(n<1024)return n+' B'; if(n<1048576)return (n/1024).toFixed(1)+' KB';
+    return (n/1048576).toFixed(1)+' MB'; }
+  function toast(msg, err){ const d=document.createElement('div'); d.className='toast'+(err?' err':'');
+    d.textContent=msg; $('msg').appendChild(d); setTimeout(()=>d.remove(),2600); }
+  function setStatus(text, cls){ $('saveStatus').textContent=text; $('saveStatus').className='status'+(cls?' '+cls:''); }
+  function setConn(text, on){ $('connText').textContent=text; $('dot').classList.toggle('on',!!on); }
+
+  function joinerURL(){ return location.origin+location.pathname+'?room='+encodeURIComponent(st.id)+'&role=joiner'; }
+  function writeRoomIntoUI(){
+    $('roomId').value=st.id;
+    $('shareUrl').value=joinerURL();
+    $('qrUrl').value=joinerURL();
+    $('qrImg').src='/api/clip/qr?text='+encodeURIComponent(joinerURL());
+    localStorage.setItem('clip-last-room', st.id);
+  }
+  async function api(path, opt){
+    opt=opt||{};
+    const headers=Object.assign({},opt.headers||{});
+    if(opt.body) headers['Content-Type']='application/json';
+    const res=await fetch('/api/clip/'+path,{method:opt.method||'GET',headers,body:opt.body});
+    let data; try{ data=await res.json(); }catch(e){ data={error:'服务器返回异常'}; }
+    if(!res.ok){ const e=new Error(data.error||('请求失败 '+res.status)); e.status=res.status; e.data=data; throw e; }
+    return data;
+  }
+
+  function sendMsg(obj){
+    if(!st.dc||st.dc.readyState!=='open'){ setStatus('尚未直连，内容仅保存在本机'); return false; }
+    st.dc.send(JSON.stringify(obj)); return true;
+  }
+
+  function setupDC(dc){
+    st.dc=dc;
+    dc.onopen=()=>{
+      st.connected=true; setConn('已直连 · 服务端可关闭',true);
+      setStatus('已建立端到端直连','saved');
+      clearInterval(st.pollTimer);
+      api('link?id='+st.id,{method:'DELETE'}).catch(()=>{});
+      sendMsg({type:'hello',text:st.text,ts:st.textTs,files:fileMeta()});
+      flushUnsent();
+    };
+    dc.onclose=()=>{ st.connected=false; setConn('连接已断开',false); setStatus('连接已断开，可重新配对','err'); };
+    dc.onerror=()=>{ setStatus('连接错误，可重新配对','err'); };
+    dc.onmessage=e=>onMessage(e.data);
+  }
+
+  function makePC(){
+    const pc=new RTCPeerConnection({iceServers:[]});
+    pc.ondatachannel=e=>setupDC(e.channel);
+    pc.onconnectionstatechange=()=>{
+      if(pc.connectionState==='failed'){ setConn('连接失败',false); setStatus('直连失败，请重试','err'); }
+    };
+    return pc;
+  }
+
+  function waitICE(pc){
+    return new Promise(resolve=>{
+      if(pc.iceGatheringState==='complete') return resolve();
+      const done=()=>{ if(pc.iceGatheringState==='complete'){ pc.removeEventListener('icegatheringstatechange',done); resolve(); } };
+      pc.addEventListener('icegatheringstatechange',done);
+      setTimeout(()=>{ pc.removeEventListener('icegatheringstatechange',done); resolve(); },8000);
+    });
+  }
+
+  function parseDesc(text, fallbackType){
+    const raw=String(text);
+    try{
+      const o=JSON.parse(raw);
+      if(o&&o.sdp&&o.type) return o;
+    }catch(e){ /* 兼容直接粘贴 SDP 文本 */ }
+    // 裸 SDP 无法自行区分 offer/answer，必须由调用方指定；也不要 trim 结尾 \r\n
+    return {type:fallbackType||'offer', sdp:raw};
+  }
+
+  async function createOfferLocal(){
+    if(st.pc) try{ st.pc.close(); }catch(e){}
+    st.pc=makePC();
+    st.dc=st.pc.createDataChannel('clip',{ordered:true});
+    setupDC(st.dc);
+    const offer=await st.pc.createOffer();
+    await st.pc.setLocalDescription(offer);
+    await waitICE(st.pc);
+    return {type:'offer',sdp:st.pc.localDescription.sdp};
+  }
+  async function createAnswerLocal(text){
+    if(st.pc) try{ st.pc.close(); }catch(e){}
+    st.pc=makePC();
+    await st.pc.setRemoteDescription(parseDesc(text,'offer'));
+    const ans=await st.pc.createAnswer();
+    await st.pc.setLocalDescription(ans);
+    await waitICE(st.pc);
+    return {type:'answer',sdp:st.pc.localDescription.sdp};
+  }
+  async function applyAnswer(text){ await st.pc.setRemoteDescription(parseDesc(text,'answer')); }
+
+  async function autoStart(){
+    setConn(st.role==='host'?'等待对端加入':'正在连接…',false);
+    if(st.role==='joiner'){
+      try{
+        const r=await api('link?id='+st.id);
+        if(!r.offer){ setStatus('等待对端发布邀请信息…'); setTimeout(autoStart,2000); return; }
+        const ans=await createAnswerLocal(r.offer);
+        await api('link/answer',{method:'POST',body:JSON.stringify({id:st.id,answer:ans.sdp})});
+        setStatus('应答已发出，等待直连…');
+      }catch(e){ setStatus('信令不可用：'+e.message+'（可点「手动配对」）','err'); }
+    }else{
+      try{
+        const off=await createOfferLocal();
+        await api('link',{method:'POST',body:JSON.stringify({id:st.id,offer:off.sdp})});
+        setStatus('邀请已发布，等待对端加入…');
+        pollAnswer();
+      }catch(e){ setStatus('信令不可用：'+e.message+'（可点「手动配对」）','err'); }
+    }
+  }
+  function pollAnswer(){
+    clearInterval(st.pollTimer);
+    st.pollTimer=setInterval(async()=>{
+      if(st.connected||(st.pc&&st.pc.currentRemoteDescription)){ clearInterval(st.pollTimer); return; }
+      try{ const r=await api('link?id='+st.id);
+        if(r.answer){ await applyAnswer(r.answer); clearInterval(st.pollTimer); }
+      }catch(e){ /* 服务端关闭时不再轮询，直连仍继续 */ }
+    },1500);
+  }
+
+  function fileMeta(){
+    return Array.from(st.files.values()).filter(f=>f.blob).map(f=>({id:f.id,name:f.name,size:f.size,mime:f.mime}));
+  }
+  function renderFiles(){
+    const list=Array.from(st.files.values());
+    $('fileCount').textContent=list.length+' 个文件';
+    if(!list.length){ $('files').innerHTML='<div class="empty">暂无文件</div>'; return; }
+    $('files').innerHTML=list.map(f=>{
+      const ext=(f.name.split('.').pop()||'FILE').slice(0,4).toUpperCase();
+      let actions='';
+      if(f.url) actions+='<a class="btn-ghost" style="text-decoration:none;display:inline-flex;align-items:center" href="'+f.url+'" download="'+esc(f.name)+'">下载</a>';
+      else if(f.needsFetch&&st.connected) actions+='<button data-get="'+esc(f.id)+'">获取</button>';
+      else if(!f.blob) actions+='<span class="info">等待获取</span>';
+      return '<div class="file"><span class="icon">'+esc(ext)+'</span><span class="meta">'
+        +'<span class="name" title="'+esc(f.name)+'">'+esc(f.name)+'</span>'
+        +'<span class="info">'+fmtSize(f.size)+(f.blob?' · 本端':' · 对端')+'</span></span>'+actions+'</div>';
+    }).join('');
+    $('files').querySelectorAll('button[data-get]').forEach(b=>b.onclick=()=>{
+      sendMsg({type:'file-request',id:b.dataset.get}); toast('已请求文件');
+    });
+  }
+
+  function sendFileBlob(f, fid){
+    if(!st.dc||st.dc.readyState!=='open') return;
+    sendMsg({type:'file-start',id:fid,name:f.name,size:f.size,mime:f.mime,count:Math.ceil(f.size/CHUNK)});
+    let offset=0,seq=0;
+    function step(){
+      if(!st.dc||st.dc.readyState!=='open') return;
+      if(st.dc.bufferedAmount>(1<<20)){ setTimeout(step,50); return; }
+      const end=Math.min(offset+CHUNK,f.size);
+      f.blob.slice(offset,end).arrayBuffer().then(ab=>{
+        const frame=new Uint8Array(21+ab.byteLength);
+        frame[0]=1; frame.set(fromHex(fid),1);
+        new DataView(frame.buffer).setUint32(17,seq);
+        frame.set(new Uint8Array(ab),21);
+        st.dc.send(frame.buffer);
+        offset=end; seq++;
+        if(offset<f.size) step(); else sendMsg({type:'file-end',id:fid});
+      });
+    }
+    step();
+  }
+  function flushUnsent(){
+    st.files.forEach(f=>{ if(f.blob&&!f.sent){ f.sent=true; sendFileBlob(f,f.id); } });
+  }
+  function addFiles(list){
+    Array.from(list).forEach(file=>{
+      const id=toHex(crypto.getRandomValues(new Uint8Array(16)));
+      st.files.set(id,{id,name:file.name,size:file.size,mime:file.type||'application/octet-stream',
+                       blob:file,url:URL.createObjectURL(file),sent:false});
+    });
+    renderFiles(); flushUnsent();
+    toast('已添加 '+list.length+' 个文件'+(st.connected?'，正在直传':'，连接后自动发送'));
+  }
+
+  function handleMsg(m){
+    switch(m.type){
+      case 'hello':
+        if(m.ts>st.textTs){ st.textTs=m.ts; st.text=m.text; ta.value=m.text; setStatus('已同步对端内容','saved'); }
+        (m.files||[]).forEach(f=>{ if(!st.files.has(f.id)) st.files.set(f.id,Object.assign({needsFetch:true},f)); });
+        renderFiles();
+        break;
+      case 'text':
+        if(m.ts>st.textTs){ st.textTs=m.ts; st.text=m.text;
+          if(ta.value!==m.text) ta.value=m.text;
+          $('textCount').textContent=new Blob([m.text]).size.toLocaleString()+' 字节';
+          setStatus('已收到对端内容','saved'); }
+        break;
+      case 'file-start':
+        st.incoming.set(m.id,{name:m.name,size:m.size,mime:m.mime,count:m.count||Math.ceil(m.size/CHUNK),
+                              chunks:new Map(),received:0});
+        break;
+      case 'file-request':{
+        const f=st.files.get(m.id);
+        if(f&&f.blob) sendFileBlob(f,m.id);
+        break;
+      }
+    }
+  }
+  function onMessage(data){
+    if(typeof data==='string'){ let m; try{ m=JSON.parse(data); }catch(e){ return; } handleMsg(m); return; }
+    const b=new Uint8Array(data);
+    if(b.length<21||b[0]!==1) return;
+    const id=toHex(b.slice(1,17));
+    const rec=st.incoming.get(id);
+    if(!rec) return;
+    const seq=new DataView(b.buffer,b.byteOffset,b.byteLength).getUint32(17);
+    const chunk=b.slice(21);
+    if(!rec.chunks.has(seq)){ rec.chunks.set(seq,chunk); rec.received+=chunk.length; }
+    if(rec.received>=rec.size){
+      const parts=[];
+      for(let i=0;i<rec.count;i++) if(rec.chunks.has(i)) parts.push(rec.chunks.get(i));
+      const blob=new Blob(parts,{type:rec.mime});
+      st.files.set(id,{id,name:rec.name,size:rec.size,mime:rec.mime,blob,url:URL.createObjectURL(blob),sent:true});
+      st.incoming.delete(id); renderFiles(); toast('收到文件：'+rec.name);
+    }
+  }
+
+  ta.addEventListener('input',()=>{
+    st.text=ta.value; st.textTs=Date.now();
+    $('textCount').textContent=new Blob([ta.value]).size.toLocaleString()+' 字节';
+    if(st.connected) sendMsg({type:'text',text:st.text,ts:st.textTs});
+    else setStatus('未直连，内容暂存本机');
+  });
+  ta.addEventListener('keydown',e=>{
+    if(e.key==='Tab'){ e.preventDefault(); const s=ta.selectionStart,en=ta.selectionEnd;
+      ta.setRangeText('  ',s,en,'end'); ta.dispatchEvent(new Event('input')); }
+  });
+  $('copyBtn').onclick=async()=>{
+    try{ if(navigator.clipboard&&window.isSecureContext) await navigator.clipboard.writeText(ta.value);
+      else{ ta.select(); document.execCommand('copy'); } toast('内容已复制'); }
+    catch(e){ toast('复制失败，请手动选择文本',true); }
+  };
+  $('pasteBtn').onclick=async()=>{
+    try{ const t=await navigator.clipboard.readText(); ta.value=t; ta.dispatchEvent(new Event('input')); toast('已粘贴'); }
+    catch(e){ toast('浏览器不允许读取剪贴板，请用 Ctrl+V 粘贴',true); }
+  };
+  $('clearBtn').onclick=()=>{ if(!confirm('清空文本内容？（不会通知服务端，对端同步清空）')) return;
+    ta.value=''; ta.dispatchEvent(new Event('input')); };
+
+  async function copyText(text){
+    try{ if(navigator.clipboard&&window.isSecureContext) await navigator.clipboard.writeText(text);
+      else{ const i=$('shareUrl'); i.value=text; i.select(); document.execCommand('copy'); i.value=joinerURL(); }
+      toast('已复制到剪贴板'); }catch(e){ toast('复制失败，请手动复制',true); }
+  }
+  $('copyUrl').onclick=()=>copyText($('shareUrl').value);
+  $('qrCopy').onclick=()=>copyText($('qrUrl').value);
+  $('qrBtn').onclick=()=>{ writeRoomIntoUI(); $('qrModal').classList.remove('hidden'); };
+  $('qrClose').onclick=()=>$('qrModal').classList.add('hidden');
+  $('newBtn').onclick=()=>{ if(!confirm('换一个新地址并重新配对？')) return;
+    location.href=location.pathname+'?room='+randomId(); };
+
+  $('manualBtn').onclick=()=>$('manualModal').classList.remove('hidden');
+  $('mClose').onclick=()=>$('manualModal').classList.add('hidden');
+  $('mCopy').onclick=()=>{ if(!$('mLocal').value) return toast('请先生成邀请码或应答',true); copyText($('mLocal').value); };
+  $('mOffer').onclick=async()=>{
+    try{ const d=await createOfferLocal(); $('mLocal').value=JSON.stringify(d);
+      setConn('等待对端描述',false); toast('邀请码已生成，复制给对端'); }
+    catch(e){ toast('生成失败：'+e.message,true); }
+  };
+  $('mAnswer').onclick=async()=>{
+    if(!$('mRemote').value.trim()) return toast('请先粘贴对端的邀请码',true);
+    try{ const d=await createAnswerLocal($('mRemote').value); $('mLocal').value=JSON.stringify(d);
+      setConn('等待对端应用应答',false); toast('应答已生成，复制回对端'); }
+    catch(e){ toast('生成失败：'+e.message,true); }
+  };
+  $('mApply').onclick=async()=>{
+    if(!$('mRemote').value.trim()) return toast('请先粘贴对端的应答',true);
+    try{ await applyAnswer($('mRemote').value); $('manualModal').classList.add('hidden');
+      setConn('正在直连…',false); toast('已应用应答'); }
+    catch(e){ toast('应用失败：'+e.message,true); }
+  };
+
+  $('drop').onclick=()=>$('fileInput').click();
+  $('fileInput').onchange=e=>{ addFiles(e.target.files); e.target.value=''; };
+  ['dragenter','dragover'].forEach(t=>$('drop').addEventListener(t,e=>{ e.preventDefault(); $('drop').classList.add('over'); }));
+  ['dragleave','drop'].forEach(t=>$('drop').addEventListener(t,e=>{ e.preventDefault(); $('drop').classList.remove('over'); }));
+  $('drop').addEventListener('drop',e=>addFiles(e.dataTransfer.files));
+
+  document.querySelectorAll('.modal').forEach(m=>m.addEventListener('click',e=>{
+    if(e.target===m) m.classList.add('hidden');
+  }));
+  document.addEventListener('keydown',e=>{ if(e.key==='Escape') document.querySelectorAll('.modal').forEach(m=>m.classList.add('hidden')); });
+
+  const qs=new URLSearchParams(location.search);
+  let id=qs.get('room');
+  if(!validId(id)){ id=randomId(); history.replaceState(null,'',location.pathname+'?room='+id); }
+  st.id=id;
+  st.role=qs.get('role')==='joiner'?'joiner':'host';
+  writeRoomIntoUI();
+  renderFiles();
+  if(!window.RTCPeerConnection){ setStatus('当前浏览器不支持 WebRTC 直连','err'); }
+  else autoStart();
+})();
+</script>
+</body>
+</html>
