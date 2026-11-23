@@ -9,11 +9,16 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
 
-const aria2cRPCPort = "6800"
+const (
+	aria2cRPCPort = "6800"
+	aria2cArchive = "aria2c.7z"
+	aria2c7zrPath = "static/7zr.exe"
+)
 
 var (
 	aria2cMu       sync.Mutex
@@ -134,13 +139,13 @@ func aria2cServiceBase(pageURL string) string {
 	return u.Scheme + "://" + u.Host
 }
 
-// updateAria2cExe 从当前服务的 /aria2c.exe 下载并替换当前目录下的 aria2c.exe
+// updateAria2cExe 从当前服务的 /aria2c.7z 下载压缩包，用内嵌的 7zr.exe 解压出 aria2c.exe
 func updateAria2cExe(base string) error {
 	if base == "" {
 		return fmt.Errorf("无法从页面地址推导服务地址")
 	}
 	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Get(base + "/aria2c.exe")
+	resp, err := client.Get(base + "/" + aria2cArchive)
 	if err != nil {
 		return err
 	}
@@ -148,7 +153,7 @@ func updateAria2cExe(base string) error {
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("服务返回 %s", resp.Status)
 	}
-	tmp, err := os.CreateTemp(".", "aria2c-*.exe.tmp")
+	tmp, err := os.CreateTemp(".", "aria2c-*.7z.tmp")
 	if err != nil {
 		return err
 	}
@@ -165,11 +170,49 @@ func updateAria2cExe(base string) error {
 	if n == 0 {
 		return fmt.Errorf("下载内容为空")
 	}
-	if err := os.Rename(tmpPath, "aria2c.exe"); err != nil {
+	if err := extractAria2cExe(tmpPath, "aria2c.exe"); err != nil {
 		return err
 	}
-	aria2cLog("已从 %s/aria2c.exe 更新本地文件（%d 字节）", base, n)
+	aria2cLog("已从 %s/%s 解压更新本地文件（压缩包 %d 字节）", base, aria2cArchive, n)
 	return nil
+}
+
+// extractAria2cExe 用内嵌的 7zr.exe 从压缩包中解压出 aria2c.exe 并替换目标文件
+func extractAria2cExe(archive, dest string) error {
+	data, err := staticFS.ReadFile(aria2c7zrPath)
+	if err != nil {
+		return fmt.Errorf("读取内嵌 %s 失败：%w", aria2c7zrPath, err)
+	}
+	tmpDir, err := os.MkdirTemp(".", "aria2c-unpack-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmpDir)
+
+	sevenZr := filepath.Join(tmpDir, "7zr.exe")
+	if err := os.WriteFile(sevenZr, data, 0755); err != nil {
+		return fmt.Errorf("写入临时 7zr.exe 失败：%w", err)
+	}
+	outDir := filepath.Join(tmpDir, "out")
+	if err := os.MkdirAll(outDir, 0755); err != nil {
+		return err
+	}
+
+	cmd := exec.Command(sevenZr, "x", "-y", "-o"+outDir, archive, "aria2c.exe")
+	hideWindow(cmd)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("7zr.exe 解压失败：%w（%s）", err, strings.TrimSpace(string(out)))
+	}
+
+	extracted := filepath.Join(outDir, "aria2c.exe")
+	st, err := os.Stat(extracted)
+	if err != nil {
+		return fmt.Errorf("解压结果 %s 不可用：%w", extracted, err)
+	}
+	if st.IsDir() || st.Size() == 0 {
+		return fmt.Errorf("解压结果 %s 不是有效文件", extracted)
+	}
+	return os.Rename(extracted, dest)
 }
 
 // ensureAria2cFromURL 在加载本机 AriaNg 页面时检查 aria2c 与 6800 端口，

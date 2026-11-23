@@ -40,8 +40,10 @@
   .idbox{display:flex;align-items:center;gap:3px}
   .idbox .hash{font-family:ui-monospace,Consolas,monospace;color:var(--muted);font-size:13px}
   #roomId{font-family:ui-monospace,Consolas,monospace;width:130px;font-weight:600;color:var(--primary)}
-  .urlbox{flex:1 1 320px;display:flex;gap:4px;min-width:0}
-  #shareUrl{flex:1;width:100%;background:#f9fafb;font-family:ui-monospace,Consolas,monospace;color:var(--muted)}
+  .urlbox{flex:1 1 420px;display:flex;flex-wrap:wrap;gap:4px;min-width:0}
+  #shareHost{max-width:190px}
+  #sharePort{width:66px;text-align:center}
+  #shareUrl{flex:1 1 240px;width:100%;background:#f9fafb;font-family:ui-monospace,Consolas,monospace;color:var(--muted)}
   .dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#9ca3af;margin-right:4px;vertical-align:1px}
   .dot.on{background:var(--ok);box-shadow:0 0 0 3px rgba(22,163,74,.12)}
   .conn{font-size:11.5px;color:var(--muted);white-space:nowrap}
@@ -109,11 +111,19 @@
 
   <div class="card roombar">
     <span class="idbox"><span class="hash">#</span><input type="text" id="roomId" readonly title="连接标识"></span>
-    <div class="urlbox"><input type="text" id="shareUrl" readonly><button class="btn-ghost" id="copyUrl">复制给对端</button></div>
-    <button class="btn-ghost" id="qrBtn">二维码</button>
-    <button class="btn-ghost" id="manualBtn">手动配对（无需服务端）</button>
-    <button class="btn-ghost" id="newBtn">换一个地址</button>
-    <span class="conn"><i class="dot" id="dot"></i><span id="connText">准备中</span></span>
+    <div class="urlbox">
+      <select id="shareHost" title="选择对端可访问的地址（来自服务端接口）"></select>
+      <input type="text" id="sharePort" title="端口（来自服务端接口，可修改）" inputmode="numeric">
+      <input type="text" id="shareUrl" readonly title="对端加入地址">
+      <button class="btn-ghost" id="copyUrl">复制给对端</button>
+    </div>
+    <div>
+      <button class="btn-ghost" id="qrBtn">二维码</button>
+      <button class="btn-ghost" id="manualBtn">手动配对（无需服务端）</button>
+      <button class="btn-ghost" id="newBtn">换一个地址</button>
+      <span class="conn"><i class="dot" id="dot"></i><span id="connText">准备中</span></span>
+
+    </div>
   </div>
 
   <div class="layout">
@@ -189,8 +199,8 @@
   const $ = id => document.getElementById(id);
   const ta = $('text');
   const CHUNK = 16384;
-  const st = {id:'', role:'host', pc:null, dc:null, connected:false,
-              text:'', textTs:0, files:new Map(), incoming:new Map(), pollTimer:null};
+  const st = {id:'', role:'host', pc:null, dc:null, connected:false, webSync:false,
+              text:'', textTs:0, files:new Map(), incoming:new Map(), pollTimer:null, webPollTimer:null};
 
   function randomId(){ const a=new Uint8Array(5); crypto.getRandomValues(a);
     return Array.from(a,b=>b.toString(16).padStart(2,'0')).join(''); }
@@ -205,7 +215,44 @@
   function setStatus(text, cls){ $('saveStatus').textContent=text; $('saveStatus').className='status'+(cls?' '+cls:''); }
   function setConn(text, on){ $('connText').textContent=text; $('dot').classList.toggle('on',!!on); }
 
-  function joinerURL(){ return location.origin+location.pathname+'?room='+encodeURIComponent(st.id)+'&role=joiner'; }
+  function shareOrigin(){
+    const sel=$('shareHost'), opt=sel.options[sel.selectedIndex];
+    const host=(opt && opt.value) || location.hostname;
+    const proto=(opt && opt.getAttribute('data-proto')) || location.protocol;
+    const port=$('sharePort').value.trim();
+    return proto+'//'+host+(port?':'+port:'');
+  }
+  function joinerURL(){ return shareOrigin()+location.pathname+'?room='+encodeURIComponent(st.id)+'&role=joiner'; }
+  function addShareOption(host, proto, label){
+    const sel=$('shareHost');
+    if(Array.from(sel.options).some(o=>o.value===host)) return;
+    const o=document.createElement('option');
+    o.value=host; o.setAttribute('data-proto',proto); o.textContent=label;
+    sel.appendChild(o);
+  }
+  async function loadShareHosts(){
+    const sel=$('shareHost');
+    sel.innerHTML='';
+    addShareOption(location.hostname, location.protocol, '当前访问地址 ('+location.hostname+')');
+    let port=location.port||(location.protocol==='https:'?'443':'80');
+    try{
+      const res=await fetch('/api/localnet');
+      if(res.ok){
+        const r=await res.json();
+        if(r.port) port=String(r.port);
+        (r.ifaces||[]).forEach(it=>{
+          const ip=String(it.ip||'').trim();
+          if(!ip || ip==='0.0.0.0' || /^127\./.test(ip) || /^169\.254\./.test(ip)) return;
+          addShareOption(ip, 'http:', ip+(it.kind?' · '+it.kind:''));
+        });
+      }
+    }catch(e){}
+    const savedHost=localStorage.getItem('clip-share-host');
+    const savedPort=localStorage.getItem('clip-share-port');
+    if(savedHost && Array.from(sel.options).some(o=>o.value===savedHost)) sel.value=savedHost;
+    $('sharePort').value=savedPort||port;
+    writeRoomIntoUI();
+  }
   function writeRoomIntoUI(){
     $('roomId').value=st.id;
     $('shareUrl').value=joinerURL();
@@ -221,6 +268,46 @@
     let data; try{ data=await res.json(); }catch(e){ data={error:'服务器返回异常'}; }
     if(!res.ok){ const e=new Error(data.error||('请求失败 '+res.status)); e.status=res.status; e.data=data; throw e; }
     return data;
+  }
+
+  function isLocalPage(){
+    const h=String(location.hostname||'').toLowerCase().replace(/^\[|\]$/g,'');
+    return h==='localhost'||h==='127.0.0.1'||h==='::1';
+  }
+  function applyRemoteText(text, ts, fromServer){
+    const t=Number(ts)||0;
+    if(t<=st.textTs) return false;
+    st.textTs=t; st.text=String(text||'');
+    if(ta.value!==st.text) ta.value=st.text;
+    $('textCount').textContent=new Blob([st.text]).size.toLocaleString()+' 字节';
+    setStatus(fromServer?'已同步服务端文本':'已收到对端内容','saved');
+    return true;
+  }
+  async function loadServerText(silent){
+    try{
+      const r=await api('text?id='+encodeURIComponent(st.id));
+      const changed=applyRemoteText(r.text,r.ts,true);
+      if(!silent&&!changed) setStatus('本地模式：文本通过服务端同步','saved');
+    }catch(e){ setStatus('本地文本同步不可用：'+e.message,'err'); }
+  }
+  async function saveServerText(){
+    const text=ta.value, ts=Date.now();
+    st.text=text; st.textTs=ts;
+    $('textCount').textContent=new Blob([text]).size.toLocaleString()+' 字节';
+    try{
+      const r=await api('text?id='+encodeURIComponent(st.id),{method:'POST',body:JSON.stringify({text,ts})});
+      applyRemoteText(r.text,r.ts,true);
+      setStatus('已保存到本机服务端','saved');
+    }catch(e){ setStatus('保存失败：'+e.message,'err'); }
+  }
+  function startWebSync(){
+    st.webSync=true;
+    setConn('本地服务同步 · 仅文本',true);
+    $('manualBtn').disabled=true; $('manualBtn').title='本地模式不使用 WebRTC，手动配对不可用';
+    setStatus('本地模式：正在读取文本…');
+    loadServerText(false);
+    clearInterval(st.webPollTimer);
+    st.webPollTimer=setInterval(()=>loadServerText(true),1500);
   }
 
   function sendMsg(obj){
@@ -420,6 +507,7 @@
   }
 
   ta.addEventListener('input',()=>{
+    if(st.webSync){ saveServerText(); return; }
     st.text=ta.value; st.textTs=Date.now();
     $('textCount').textContent=new Blob([ta.value]).size.toLocaleString()+' 字节';
     if(st.connected) sendMsg({type:'text',text:st.text,ts:st.textTs});
@@ -446,6 +534,8 @@
       else{ const i=$('shareUrl'); i.value=text; i.select(); document.execCommand('copy'); i.value=joinerURL(); }
       toast('已复制到剪贴板'); }catch(e){ toast('复制失败，请手动复制',true); }
   }
+  $('shareHost').addEventListener('change',()=>{ localStorage.setItem('clip-share-host',$('shareHost').value); writeRoomIntoUI(); });
+  $('sharePort').addEventListener('input',()=>{ localStorage.setItem('clip-share-port',$('sharePort').value.trim()); writeRoomIntoUI(); });
   $('copyUrl').onclick=()=>copyText($('shareUrl').value);
   $('qrCopy').onclick=()=>copyText($('qrUrl').value);
   $('qrBtn').onclick=()=>{ writeRoomIntoUI(); $('qrModal').classList.remove('hidden'); };
@@ -491,8 +581,10 @@
   st.id=id;
   st.role=qs.get('role')==='joiner'?'joiner':'host';
   writeRoomIntoUI();
+  loadShareHosts();
   renderFiles();
-  if(!window.RTCPeerConnection){ setStatus('当前浏览器不支持 WebRTC 直连','err'); }
+  if(!window.RTCPeerConnection && isLocalPage()) startWebSync();
+  else if(!window.RTCPeerConnection){ setStatus('当前浏览器不支持 WebRTC 直连','err'); }
   else autoStart();
 })();
 </script>

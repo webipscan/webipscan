@@ -586,8 +586,9 @@ func registerMbEvents(optional func(string, ...uintptr) uintptr, view uintptr, a
 		urlMu.Unlock()
 		mbLogEvent("地址变化", fmt.Sprintf("%s [后退:%d 前进:%d]", addr, canBack, canForward))
 		if isAriaNgURL(addr) {
-			mbLogEvent("页面识别", "本机 AriaNg 页面已加载")
-			go ensureAria2cFromURL(addr)
+			mbLogEvent("页面识别", "本机 AriaNg 页面，准备 aria2c")
+			// 地址变化时同步完成 aria2c 的更新与启动，避免新页面内容先于 RPC 服务加载
+			ensureAria2cFromURL(addr)
 		}
 		if !isLocalMbURL(addr) {
 			setWindowTitle(addr)
@@ -629,6 +630,9 @@ func registerMbEvents(optional func(string, ...uintptr) uintptr, view uintptr, a
 
 	// 关闭「链接点击弹新窗口」，让链接在当前窗口直接跳转
 	optional("mbSetNavigationToNewWindowEnable", view, 0)
+
+	// 开启右键菜单；a 链接地址的复制由 registerMbLinkCopy 注入的脚本完成
+	optional("mbSetContextMenuEnabled", view, 1)
 
 	// 文件下载：另存为对话框 + 进度日志
 	registerMbDownloads(optional, view)
@@ -836,6 +840,7 @@ func runMbWindow(dllPath, url, homeURL string, allowLinks bool) error {
 
 	// 注册事件回调与链接跳转参数（必须在加载 URL 之前）
 	registerMbEvents(optional, view, allowLinks, url)
+	registerMbLinkCopy(proc, view)
 	if proc("mbOnDownloadInBlinkThread").Find() != nil {
 		mbLogEvent("下载", "当前 mb132_x64.dll 不支持另存为下载回调，文件下载功能不可用")
 	}

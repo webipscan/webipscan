@@ -13,8 +13,8 @@ import (
 )
 
 const (
-	clipMaxSDP  = 512 << 10            // SDP 描述上限
-	clipLinkTTL = 30 * time.Minute     // 信令信息最长保留时间
+	clipMaxSDP  = 512 << 10        // SDP 描述上限
+	clipLinkTTL = 30 * time.Minute // 信令信息最长保留时间
 )
 
 var clipIDRE = regexp.MustCompile(`^[A-Za-z0-9_-]{3,32}$`)
@@ -87,10 +87,12 @@ func decodeClipBody(r *http.Request, v interface{}) error {
 	return dec.Decode(v)
 }
 
-// handleClipAPI 只提供信令交换与二维码生成，不涉及任何内容存储。
+// handleClipAPI 提供信令交换、二维码生成，以及本机无 WebRTC 时的文本同步。
 func handleClipAPI(w http.ResponseWriter, r *http.Request) {
 	s := clipStoreGlobal
 	switch strings.TrimPrefix(r.URL.Path, "/api/clip/") {
+	case "text":
+		handleClipText(w, r)
 	case "config":
 		clipJSON(w, http.StatusOK, map[string]interface{}{
 			"mode": "webrtc", "signalingOnly": true, "linkTTL": int(clipLinkTTL / time.Minute),

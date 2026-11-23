@@ -260,8 +260,8 @@
     </div>
     <!-- <span><a href="https://easy.apnode.cn/" target="_self">EASY-CD</a></span> -->
     <!-- <span><a class="link-btn" href="clip.html" target="_self">Clip</a></span> -->
-    <span><a class="link-btn" href="AriaNg.html" target="_self">AriaNg</a></span>
-    <span><a class="link-btn" href="clip.html" target="_self">网络剪贴板</a></span>
+    <span><a class="link-btn" href="AriaNg.html" target="_self">AriaNg（Ctrl+Home返回）</a></span>
+    <span><a class="link-btn" href="clip.html" target="_self">网络剪贴板（待完善,需要局域网访问使用）</a></span>
   </header>
 
   <div id="msg" class="msg"></div>
@@ -549,6 +549,9 @@
     </div>
   </div>
 
+  
+
+
   <!-- 文件拖入检测 -->
   <div class="card file-card" id="fileCard">
     <div class="file-head">
@@ -613,6 +616,16 @@
         </div>
       </div>
 
+
+      <!-- url -->
+      <div class="card url-card" id="urlCard">
+        <div class="sub" style="margin-bottom:8px">迷你浏览器：输入网址后由服务端检测可访问性，正常时打开页面</div>
+        <div class="form-row">
+          <button class="btn-primary" id="urlCardOpenBtn">打开网站地址 (Ctrl+G)</button>
+        </div>
+      </div>
+
+
       <!-- 程序信息 -->
       <div class="card">
         <div class="sub" style="margin-bottom:6px">程序信息</div>
@@ -647,11 +660,12 @@
 <div class="modal-mask hide" id="urlModal">
   <div class="modal">
     <h3>打开网站地址</h3>
-    <div class="sub">回车打开，Esc 取消；快捷键 Ctrl + G</div>
+    <div class="sub">回车打开，Esc 取消；快捷键 Ctrl + G（由服务端检测地址可访问性）</div>
     <input type="text" id="urlInput" placeholder="例如 https://www.example.com 或 192.168.1.1:8080">
+    <div id="urlCheckMsg" class="msg"></div>
     <div class="modal-actions">
       <button class="btn-ghost" id="urlCancelBtn">取消</button>
-      <button class="btn-primary" id="urlOpenBtn">打开</button>
+      <button class="btn-primary" id="urlOpenBtn">检测并打开</button>
     </div>
   </div>
 </div>
@@ -659,7 +673,7 @@
 <div class="ext-overlay hide" id="extOverlay">
   <div class="ext-bar">
     <span class="sub ext-addr" id="extAddr"></span>
-    <button class="btn-ghost" id="extNewWinBtn" style="height:26px;font-size:12px">新窗口打开</button>
+    <button class="btn-ghost" id="extNewWinBtn" style="height:26px;font-size:12px">(Ctrl+点击打开链接或下载)</button>
     <button class="btn-ghost" id="extBackBtn" style="height:26px;font-size:12px">返回本地 (Ctrl+Home)</button>
   </div>
   <iframe class="ext-frame" id="extFrame" src="about:blank" title="网站地址"
@@ -2215,22 +2229,50 @@ function normalizeWebURL(raw){
   }catch(_){ return ''; }
 }
 
+let urlChecking = false;
+function setUrlCheckMsg(text, type){
+  const m = $('urlCheckMsg');
+  m.textContent = text;
+  m.className = 'msg' + (text ? ' ' + (type || 'info') : '');
+}
 function openUrlModal(){
   $('urlInput').value = '';
+  setUrlCheckMsg('');
   $('urlModal').classList.remove('hide');
   $('urlInput').focus();
 }
 function closeUrlModal(){ $('urlModal').classList.add('hide'); }
 
-function openWebsite(){
-  const url = normalizeWebURL($('urlInput').value);
-  if(!url){ showMsg('请输入有效的 http(s) 网站地址', 'error'); return; }
-  showMsg('');
-  closeUrlModal();
-  $('extAddr').textContent = url;
-  $('extAddr').title = url;
-  $('extFrame').src = url;
-  $('extOverlay').classList.remove('hide');
+async function openWebsite(){
+  if(urlChecking) return;
+  const raw = $('urlInput').value;
+  const url = normalizeWebURL(raw);
+  if(!url){ setUrlCheckMsg('请输入有效的 http(s) 网站地址', 'error'); return; }
+  urlChecking = true;
+  const btn = $('urlOpenBtn'), oldText = btn.textContent;
+  btn.disabled = true; btn.textContent = '检测中…';
+  setUrlCheckMsg('正在检测网址是否可访问…', 'info');
+  try{
+    const resp = await fetch('/api/url/check?url=' + encodeURIComponent(raw));
+    const r = await resp.json().catch(() => ({}));
+    if(!resp.ok || !r.ok){
+      setUrlCheckMsg(r.error || '网址检测失败，未打开页面', 'error');
+      return;
+    }
+    setUrlCheckMsg('');
+    closeUrlModal();
+    const target = r.url || url;
+    $('extAddr').textContent = target;
+    $('extAddr').title = target;
+    $('extFrame').src = target;
+    $('extOverlay').classList.remove('hide');
+  }catch(e){
+    setUrlCheckMsg('检测请求失败：' + (e && e.message ? e.message : '无法连接服务端'), 'error');
+  }finally{
+    urlChecking = false;
+    btn.disabled = false;
+    btn.textContent = oldText;
+  }
 }
 
 function backToLocal(){
@@ -2258,6 +2300,7 @@ document.addEventListener('keydown', e => {
   }
 });
 
+$('urlCardOpenBtn').onclick = openUrlModal;
 $('urlOpenBtn').onclick = openWebsite;
 $('urlCancelBtn').onclick = closeUrlModal;
 $('urlInput').addEventListener('keydown', e => { if(e.key === 'Enter') openWebsite(); });

@@ -39,7 +39,10 @@ const (
 //	go build -ldflags="-s -w -X main.AppVersion=1.2.3" -o ipscan.exe .
 //
 // 若 exe 带有 Windows 版本资源，则优先使用资源中的真实文件版本。
-var AppVersion = "1.0.0"
+var AppVersion = "1.0.1"
+
+// serverPort 为 listenPort 探测后实际监听的端口，供前端生成可访问的分享地址
+var serverPort string
 
 // aboutHandler 返回当前 exe 的版本与哈希信息
 func aboutHandler(w http.ResponseWriter, r *http.Request) {
@@ -254,6 +257,7 @@ func main() {
 		fmt.Println("启动失败：" + err.Error())
 		exitMain(1)
 	}
+	serverPort = actual
 
 	http.HandleFunc("/", handleStatic)
 	// http.HandleFunc("/aria2c.exe", handleAria2cExe)
@@ -275,6 +279,8 @@ func main() {
 	http.HandleFunc("/api/dns/servers", handleDNSServers)
 	http.HandleFunc("/api/dns/query", handleDNSQuery)
 	http.HandleFunc("/api/publicip", handlePublicIP)
+	// 网址可访问性检测：迷你浏览器跳转前由服务端校验
+	http.HandleFunc("/api/url/check", handleURLCheck)
 	// 网络剪贴板：仅交换 WebRTC 连接信息（SDP），内容与文件在浏览器间直传
 	http.HandleFunc("/api/clip/", handleClipAPI)
 
@@ -402,11 +408,12 @@ func handleInterfaces(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(ListLocalIfaces())
 }
 
-// handleLocalNet 推测本机所在网段，便于前端默认填充
+// handleLocalNet 推测本机所在网段，并返回实际监听端口，便于前端生成局域网分享地址
 func handleLocalNet(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"cidr":   guessLocalCIDR(),
+		"port":   serverPort,
 		"ifaces": ListLocalIfaces(),
 	})
 }
