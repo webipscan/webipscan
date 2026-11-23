@@ -41,7 +41,7 @@ const (
 //	go build -ldflags="-s -w -X main.AppVersion=1.2.3" -o ipscan.exe .
 //
 // 若 exe 带有 Windows 版本资源，则优先使用资源中的真实文件版本。
-var AppVersion = "1.0.1"
+var AppVersion = "1.0.3"
 
 // serverPort 为 listenPort 探测后实际监听的端口，供前端生成可访问的分享地址
 var serverPort string
