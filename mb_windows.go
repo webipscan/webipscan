@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -52,8 +53,8 @@ var (
 	procMapVirtualKeyW        = modUser32.NewProc("MapVirtualKeyW")
 	procGetKeyNameTextW       = modUser32.NewProc("GetKeyNameTextW")
 
-	// C 侧可能长期持有这些字符串指针，放在包级避免被 GC 回收
-	mbUTF16Strings []*uint16
+	// 会话级资源：DLL 路径、任务/关闭回调等，生命周期与进程一致。
+	mbSessionResources = newMbResourceSet()
 
 	// 共享控制台模式下是否通过 FreeConsole 脱离过控制台
 	mbConsoleDetached bool
@@ -64,25 +65,78 @@ var (
 	}
 )
 
-// utf16Arg 把字符串转为 Windows UTF-16 指针，并长期持有该内存
-func utf16Arg(s string) uintptr {
+// mbResourceSet 保存一组 C 侧可能长期持有的字符串与 Go 回调。
+// 每个窗口使用独立资源集，窗口关闭后可整体释放，避免全局池无限增长。
+type mbResourceSet struct {
+	mu           sync.Mutex
+	utf16Strings []*uint16
+	utf8Strings  [][]byte
+	callbacks    []any
+	utf16Ring    []*uint16 // 频繁变化的标题等：只保留最近若干份
+	ringNext     int
+	releaseOnce  sync.Once
+}
+
+func newMbResourceSet() *mbResourceSet { return &mbResourceSet{} }
+
+func (r *mbResourceSet) utf16Arg(s string) uintptr {
 	p, err := syscall.UTF16PtrFromString(s)
 	if err != nil {
 		return 0
 	}
-	mbUTF16Strings = append(mbUTF16Strings, p)
+	r.mu.Lock()
+	r.utf16Strings = append(r.utf16Strings, p)
+	r.mu.Unlock()
 	return uintptr(unsafe.Pointer(p))
 }
 
-// mbGoCallbacks 保持回调闭包存活，直到进程退出
-var mbGoCallbacks []any
+// utf16ArgVolatile 用固定大小的环形缓存保存短生命周期字符串（如窗口标题）。
+// miniblink 的 mbSetWindowTitleW 会复制字符串内容，旧指针可安全复用。
+func (r *mbResourceSet) utf16ArgVolatile(s string, keep int) uintptr {
+	p, err := syscall.UTF16PtrFromString(s)
+	if err != nil {
+		return 0
+	}
+	if keep < 1 {
+		keep = 1
+	}
+	r.mu.Lock()
+	if len(r.utf16Ring) < keep {
+		r.utf16Ring = append(r.utf16Ring, p)
+		r.ringNext = len(r.utf16Ring) % keep
+	} else {
+		r.utf16Ring[r.ringNext] = p
+		r.ringNext = (r.ringNext + 1) % keep
+	}
+	r.mu.Unlock()
+	return uintptr(unsafe.Pointer(p))
+}
 
-// mbNewCallback 创建并持有 Go 回调（stdcall，与 MB_CALL_TYPE 一致）
-func mbNewCallback(fn any) uintptr {
+// callback 创建 Go 回调（stdcall，与 MB_CALL_TYPE 一致）并持有闭包。
+func (r *mbResourceSet) callback(fn any) uintptr {
 	cb := syscall.NewCallback(fn)
-	mbGoCallbacks = append(mbGoCallbacks, fn)
+	r.mu.Lock()
+	r.callbacks = append(r.callbacks, fn)
+	r.mu.Unlock()
 	return cb
 }
+
+// release 丢弃本资源集持有的引用，让 GC 回收对应内存。
+func (r *mbResourceSet) release() {
+	r.releaseOnce.Do(func() {
+		r.mu.Lock()
+		r.utf16Strings = nil
+		r.utf8Strings = nil
+		r.callbacks = nil
+		r.utf16Ring = nil
+		r.mu.Unlock()
+	})
+}
+
+// utf16Arg / mbNewCallback 供会话级资源使用。
+func utf16Arg(s string) uintptr { return mbSessionResources.utf16Arg(s) }
+
+func mbNewCallback(fn any) uintptr { return mbSessionResources.callback(fn) }
 
 // mbUTF8String 读取 miniblink 回调传入的 UTF-8 字符串（以 NUL 结尾）
 func mbUTF8String(p unsafe.Pointer) string {
@@ -173,8 +227,6 @@ type mbDownloadInfo struct {
 }
 
 var (
-	mbUTF8Mu        sync.Mutex
-	mbUTF8Strings   [][]byte
 	mbDownloads     sync.Map // job -> *mbDownloadInfo
 	mbDownloadBinds sync.Map // job -> *mbDownloadBindsHold（保持 C 结构体内存存活）
 )
@@ -185,14 +237,17 @@ type mbDownloadBindsHold struct {
 	dialog   *mbDialogOptions
 }
 
-// mbUTF8Arg 分配以 NUL 结尾的 UTF-8 字符串（miniblink 的 const char* 参数）
-func mbUTF8Arg(s string) uintptr {
+// utf8Arg 分配以 NUL 结尾的 UTF-8 字符串（miniblink 的 const char* 参数）
+func (r *mbResourceSet) utf8Arg(s string) uintptr {
 	b := append([]byte(s), 0)
-	mbUTF8Mu.Lock()
-	mbUTF8Strings = append(mbUTF8Strings, b)
-	mbUTF8Mu.Unlock()
+	r.mu.Lock()
+	r.utf8Strings = append(r.utf8Strings, b)
+	r.mu.Unlock()
 	return uintptr(unsafe.Pointer(&b[0]))
 }
+
+// mbUTF8Arg 供会话级资源使用。
+func mbUTF8Arg(s string) uintptr { return mbSessionResources.utf8Arg(s) }
 
 // mbUTF16StringN 读取以 NUL 结尾的 WCHAR 字符串
 func mbUTF16StringN(p unsafe.Pointer, max int) string {
@@ -479,8 +534,8 @@ func isAriaNgURL(u string) bool {
 
 // registerMbDownloads 注册下载回调：触发下载时弹出「另存为」对话框并由内核完成下载，
 // 开始/进度/完成/保存路径输出到控制台。该回调在 Blink 线程执行，这里只调用下载相关 mb* API。
-func registerMbDownloads(optional func(string, ...uintptr) uintptr, view uintptr) {
-	recvCB := mbNewCallback(func(_ uintptr, job uintptr, _ unsafe.Pointer, length uintptr) uintptr {
+func registerMbDownloads(optional func(string, ...uintptr) uintptr, view uintptr, res *mbResourceSet) {
+	recvCB := res.callback(func(_ uintptr, job uintptr, _ unsafe.Pointer, length uintptr) uintptr {
 		if v, ok := mbDownloads.Load(job); ok {
 			info := v.(*mbDownloadInfo)
 			if n := int64(int32(length)); n > 0 {
@@ -493,7 +548,7 @@ func registerMbDownloads(optional func(string, ...uintptr) uintptr, view uintptr
 		}
 		return 0
 	})
-	finishCB := mbNewCallback(func(_ uintptr, job uintptr, result uintptr) uintptr {
+	finishCB := res.callback(func(_ uintptr, job uintptr, result uintptr) uintptr {
 		if v, ok := mbDownloads.Load(job); ok {
 			info := v.(*mbDownloadInfo)
 			state := "完成"
@@ -510,11 +565,11 @@ func registerMbDownloads(optional func(string, ...uintptr) uintptr, view uintptr
 		mbDownloadBinds.Delete(job)
 		return 0
 	})
-	saveNameCB := mbNewCallback(func(_ uintptr, path unsafe.Pointer) uintptr {
+	saveNameCB := res.callback(func(_ uintptr, path unsafe.Pointer) uintptr {
 		mbLogEvent("下载", "保存位置 "+mbUTF16StringN(path, 4096))
 		return 0
 	})
-	startCB := mbNewCallback(func(webView uintptr, _ unsafe.Pointer, expected uintptr,
+	startCB := res.callback(func(webView uintptr, _ unsafe.Pointer, expected uintptr,
 		urlPtr, mimePtr, dispositionPtr unsafe.Pointer, job uintptr, dataBindPtr unsafe.Pointer) uintptr {
 		url := mbUTF8String(urlPtr)
 		mbDownloads.Store(job, &mbDownloadInfo{url: url, expected: expected})
@@ -524,11 +579,11 @@ func registerMbDownloads(optional func(string, ...uintptr) uintptr, view uintptr
 		bind := mbDownloadBind{recvCallback: recvCB, finishCallback: finishCB, saveNameCallback: saveNameCB}
 		dialog := mbDialogOptions{
 			magic:       mbDialogMagic,
-			title:       mbUTF8Arg("保存文件"),
-			buttonLabel: mbUTF8Arg("保存"),
+			title:       res.utf8Arg("保存文件"),
+			buttonLabel: res.utf8Arg("保存"),
 		}
 		if dir := mbDownloadDir(); dir != "" {
-			dialog.defaultPath = mbUTF8Arg(dir)
+			dialog.defaultPath = res.utf8Arg(dir)
 		}
 		mbDownloadBinds.Store(job, &mbDownloadBindsHold{dataBind: &dataBind, bind: &bind, dialog: &dialog})
 
@@ -552,7 +607,7 @@ func registerMbDownloads(optional func(string, ...uintptr) uintptr, view uintptr
 
 // registerMbEvents 注册浏览器事件回调；allowLinks=false 时拦截链接点击与表单提交。
 // 窗口标题显示当前页面 URL，但本机页面（localhost / 127.0.0.1）保留网页标题。
-func registerMbEvents(optional func(string, ...uintptr) uintptr, view uintptr, allowLinks bool, initialURL string) {
+func registerMbEvents(optional func(string, ...uintptr) uintptr, view uintptr, allowLinks bool, initialURL string, res *mbResourceSet) {
 	var urlMu sync.Mutex
 	currentURL := initialURL
 	getURL := func() string {
@@ -564,12 +619,12 @@ func registerMbEvents(optional func(string, ...uintptr) uintptr, view uintptr, a
 		if u == "" {
 			return
 		}
-		if p := utf16Arg(u); p != 0 {
+		if p := res.utf16ArgVolatile(u, 8); p != 0 {
 			optional("mbSetWindowTitleW", view, p)
 		}
 	}
 
-	titleCB := mbNewCallback(func(_ uintptr, _ unsafe.Pointer, title unsafe.Pointer) uintptr {
+	titleCB := res.callback(func(_ uintptr, _ unsafe.Pointer, title unsafe.Pointer) uintptr {
 		mbLogEvent("标题变化", mbUTF8String(title))
 		// 本机页面保留网页标题；其他页面改回显示 URL
 		if u := getURL(); !isLocalMbURL(u) {
@@ -579,7 +634,7 @@ func registerMbEvents(optional func(string, ...uintptr) uintptr, view uintptr, a
 	})
 	optional("mbOnTitleChanged", view, titleCB, 0)
 
-	urlCB := mbNewCallback(func(_ uintptr, _ unsafe.Pointer, u unsafe.Pointer, canBack, canForward uintptr) uintptr {
+	urlCB := res.callback(func(_ uintptr, _ unsafe.Pointer, u unsafe.Pointer, canBack, canForward uintptr) uintptr {
 		addr := mbUTF8String(u)
 		urlMu.Lock()
 		currentURL = addr
@@ -597,7 +652,7 @@ func registerMbEvents(optional func(string, ...uintptr) uintptr, view uintptr, a
 	})
 	optional("mbOnURLChanged", view, urlCB, 0)
 
-	finishCB := mbNewCallback(func(_ uintptr, _ unsafe.Pointer, _ uintptr, u unsafe.Pointer, result uintptr, reason unsafe.Pointer) uintptr {
+	finishCB := res.callback(func(_ uintptr, _ unsafe.Pointer, _ uintptr, u unsafe.Pointer, result uintptr, reason unsafe.Pointer) uintptr {
 		detail := fmt.Sprintf("结果=%d %s", result, mbUTF8String(u))
 		if reason != nil {
 			detail += " 原因=" + mbUTF8String(reason)
@@ -607,19 +662,19 @@ func registerMbEvents(optional func(string, ...uintptr) uintptr, view uintptr, a
 	})
 	optional("mbOnLoadingFinish", view, finishCB, 0)
 
-	failCB := mbNewCallback(func(_ uintptr, _ unsafe.Pointer, u unsafe.Pointer, _ unsafe.Pointer) uintptr {
+	failCB := res.callback(func(_ uintptr, _ unsafe.Pointer, u unsafe.Pointer, _ unsafe.Pointer) uintptr {
 		mbLogEvent("加载失败", mbUTF8String(u))
 		return 0
 	})
 	optional("mbOnLoadUrlFail", view, failCB, 0)
 
-	consoleCB := mbNewCallback(func(_ uintptr, _ unsafe.Pointer, level uintptr, msg, source unsafe.Pointer, line uintptr, _ unsafe.Pointer) uintptr {
+	consoleCB := res.callback(func(_ uintptr, _ unsafe.Pointer, level uintptr, msg, source unsafe.Pointer, line uintptr, _ unsafe.Pointer) uintptr {
 		mbLogEvent("页面控制台", fmt.Sprintf("级别=%d %s (行:%d)", level, mbUTF8String(msg), line))
 		return 0
 	})
 	optional("mbOnConsole", view, consoleCB, 0)
 
-	navCB := mbNewCallback(func(_ uintptr, _ unsafe.Pointer, navType uintptr, u unsafe.Pointer) uintptr {
+	navCB := res.callback(func(_ uintptr, _ unsafe.Pointer, navType uintptr, u unsafe.Pointer) uintptr {
 		mbLogEvent("导航", mbNavTypeName(navType)+" "+mbUTF8String(u))
 		if !allowLinks && (navType == mbNavLinkClick || navType == mbNavFormSubmit) {
 			return 0
@@ -635,7 +690,7 @@ func registerMbEvents(optional func(string, ...uintptr) uintptr, view uintptr, a
 	optional("mbSetContextMenuEnabled", view, 1)
 
 	// 文件下载：另存为对话框 + 进度日志
-	registerMbDownloads(optional, view)
+	registerMbDownloads(optional, view, res)
 }
 
 // setMbDllDirectory 让 mb132_x64.dll 的加载器能从同目录找到 mb132_x64.dll / mb132_x32.dll
@@ -697,7 +752,7 @@ func setConsoleVisible(show bool) {
 	}
 }
 
-// prepareMbWindow 确保 exe 目录下 mb132_x64.dll 存在且哈希正确，再验证其可用性；
+// prepareMbWindow 确保运行时目录下 mb132_x64.dll 存在且哈希正确，再验证其可用性；
 // 有效时返回 DLL 路径。文件缺失或哈希不符时，从内嵌 7z 资源解压覆盖。
 // hideConsole 为 true 时立刻隐藏控制台（正常窗口模式）；守护/无窗口模式传 false。
 // 无效时保留控制台、打印原因并返回空串（由调用方回退默认浏览器）。
@@ -718,62 +773,286 @@ func prepareMbWindow(hideConsole bool) string {
 	return p
 }
 
-// runMbWindow 按 miniblink （mb.h 声明的纯 C 接口）的方式动态加载 mb132_x64.dll，
-// 创建一个原生 Windows 窗口显示本服务页面。窗口关闭后返回 nil，
-// 加载或初始化失败时返回 error，由调用方回退到系统默认浏览器。
-// allowLinks 为 true 时允许点击页面链接在当前窗口跳转，false 时拦截链接点击。
-// homeURL 为主进程 HTTP 服务地址，窗口内按 Ctrl+Home 可返回该页面；
-// Alt+Left / Alt+Right 分别为后退 / 前进，F5 / Ctrl+R 为刷新。
-// 快捷键由 mbShortcutRegistry 集中注册，可继续 add 扩展或用取消函数撤销。
-// 窗口标题显示当前页面 URL，本机页面保留网页标题。
-// 浏览器事件（标题、地址、加载结果、导航、页面控制台）与窗口按键会输出到主控制台。
-func runMbWindow(dllPath, url, homeURL string, allowLinks bool) error {
-	// miniblink 要求 mbInit 及之后所有 mb* 调用都在同一线程
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
+// mbQuitGrace 给托盘命令留出一点时间：最后一个窗口关闭后短时间内又打开窗口时，
+// 不退出程序。超过这个时间仍无窗口才真正投递 WM_QUIT。
+const (
+	mbQuitGrace            = 400 * time.Millisecond
+	mbResourceReleaseDelay = 500 * time.Millisecond
+)
 
-	setMbDllDirectory(dllPath)
+var (
+	mbSessionMu      sync.Mutex
+	mbCurrentSession *mbSession
+	mbAllClosedCh    = make(chan struct{})
+	mbAllClosedOnce  sync.Once
+)
 
-	mb := syscall.NewLazyDLL(dllPath)
-	if err := mb.Load(); err != nil {
-		return fmt.Errorf("加载 %s 失败：%w（请确认 DLL 与 exe 位数一致、依赖齐全）", dllPath, err)
-	}
+// mbSession 管理同一个 miniblink UI 线程上的所有窗口。
+// miniblink 要求 mbInit、窗口创建、mbLoadURL、mbRunMessageLoop 等调用固定在同一线程，
+// 因此托盘命令只把任务投递到该线程，不直接调用 mb* API。
+type mbSession struct {
+	dllPath  string
+	homeURL  string
+	mb       *syscall.LazyDLL
+	procMu   sync.Mutex
+	procs    map[string]*syscall.LazyProc
+	optional func(string, ...uintptr) uintptr
 
-	procs := make(map[string]*syscall.LazyProc)
-	proc := func(name string) *syscall.LazyProc {
-		if p := procs[name]; p != nil {
-			return p
-		}
-		p := mb.NewProc(name)
-		procs[name] = p
+	viewsMu    sync.Mutex
+	views      map[uintptr]bool
+	resources  map[uintptr]*mbResourceSet
+	shortcuts  map[uintptr]*mbShortcutRegistry
+	started    bool
+	stopping   bool
+	uiThreadID uint32
+	quitTimer  *time.Timer
+
+	taskMu    sync.Mutex
+	tasks     []func()
+	taskCB    uintptr
+	closeCB   uintptr
+	destroyCB uintptr
+
+	initOnce sync.Once
+	initDone chan struct{}
+	initErr  error
+}
+
+// mbAllClosed 在所有 miniblink 窗口关闭后关闭，供主流程决定退出。
+func mbAllClosed() <-chan struct{} { return mbAllClosedCh }
+
+func notifyMbAllClosed() { mbAllClosedOnce.Do(func() { close(mbAllClosedCh) }) }
+
+func (s *mbSession) proc(name string) *syscall.LazyProc {
+	s.procMu.Lock()
+	defer s.procMu.Unlock()
+	if p := s.procs[name]; p != nil {
 		return p
 	}
-	// 必需导出：缺一个就提前失败，避免 LazyProc.Call 运行期 panic
+	p := s.mb.NewProc(name)
+	s.procs[name] = p
+	return p
+}
+
+func (s *mbSession) optionalCall(name string, args ...uintptr) uintptr {
+	p := s.proc(name)
+	if err := p.Find(); err != nil {
+		return 0
+	}
+	r, _, _ := p.Call(args...)
+	return r
+}
+
+func (s *mbSession) setStarted(v bool) {
+	s.viewsMu.Lock()
+	s.started = v
+	s.viewsMu.Unlock()
+}
+
+func (s *mbSession) finishInit(err error) {
+	s.initErr = err
+	s.initOnce.Do(func() { close(s.initDone) })
+}
+
+func (s *mbSession) reset() {
+	mbSessionMu.Lock()
+	if mbCurrentSession == s {
+		mbCurrentSession = nil
+	}
+	mbSessionMu.Unlock()
+}
+
+// startMbWindow 初始化会话并创建首个窗口；会话已存在时不重复创建，直接返回。
+// 初始化在独立 UI goroutine 中完成，这里等待结果以便调用方决定回退默认浏览器。
+func startMbWindow(dllPath, url, homeURL string, allowLinks bool) error {
+	if dllPath == "" {
+		return fmt.Errorf("未找到可用的 mb132_x64.dll")
+	}
+	mbSessionMu.Lock()
+	if s := mbCurrentSession; s != nil {
+		mbSessionMu.Unlock()
+		<-s.initDone
+		return s.initErr
+	}
+	s := &mbSession{
+		dllPath:   dllPath,
+		homeURL:   homeURL,
+		procs:     make(map[string]*syscall.LazyProc),
+		views:     make(map[uintptr]bool),
+		resources: make(map[uintptr]*mbResourceSet),
+		shortcuts: make(map[uintptr]*mbShortcutRegistry),
+		initDone:  make(chan struct{}),
+	}
+	s.optional = s.optionalCall
+	mbCurrentSession = s
+	mbSessionMu.Unlock()
+
+	go s.run(url, allowLinks)
+	<-s.initDone
+	if s.initErr != nil {
+		s.reset()
+	}
+	return s.initErr
+}
+
+// openMbWindow 供托盘命令调用：会话不存在则启动，存在则向 UI 线程投递新窗口任务。
+func openMbWindow(dllPath, url, homeURL string, allowLinks bool) error {
+	if dllPath == "" {
+		return fmt.Errorf("未找到可用的 mb132_x64.dll")
+	}
+	mbSessionMu.Lock()
+	s := mbCurrentSession
+	mbSessionMu.Unlock()
+
+	if s == nil {
+		return startMbWindow(dllPath, url, homeURL, allowLinks)
+	}
+	<-s.initDone
+	if s.initErr != nil {
+		s.reset()
+		return startMbWindow(dllPath, url, homeURL, allowLinks)
+	}
+	return s.open(url, allowLinks)
+}
+
+// post 把闭包投递到 miniblink UI 线程执行。
+func (s *mbSession) post(fn func()) error {
+	if s.proc("mbPostToUiThread").Find() != nil && s.proc("mbCallUiThreadAsync").Find() != nil {
+		return fmt.Errorf("当前 mb132_x64.dll 不支持线程投递，无法从托盘打开窗口")
+	}
+	if s.taskCB == 0 {
+		return fmt.Errorf("miniblink UI 线程尚未就绪")
+	}
+	s.taskMu.Lock()
+	s.tasks = append(s.tasks, fn)
+	s.taskMu.Unlock()
+
+	if p := s.proc("mbPostToUiThread"); p.Find() == nil {
+		p.Call(s.taskCB, 0)
+	} else {
+		s.proc("mbCallUiThreadAsync").Call(s.taskCB, 0, 0)
+	}
+	return nil
+}
+
+// postToUI 把单个 mb 回调投递到 UI 线程，供窗口级快捷键使用。
+func (s *mbSession) postToUI(cb, view uintptr, name string) {
+	if p := s.proc("mbPostToUiThread"); p.Find() == nil {
+		p.Call(cb, view)
+		return
+	}
+	if p := s.proc("mbCallUiThreadAsync"); p.Find() == nil {
+		p.Call(cb, 0, 0)
+		return
+	}
+	mbLogEvent("快捷键", fmt.Sprintf("当前 mb132_x64.dll 不支持线程投递，%s 未生效", name))
+}
+
+// open 在当前 UI 线程上再开一个窗口。
+func (s *mbSession) open(url string, allowLinks bool) error {
+	s.viewsMu.Lock()
+	started := s.started
+	if started {
+		if s.quitTimer != nil {
+			s.quitTimer.Stop()
+			s.quitTimer = nil
+		}
+		s.stopping = false
+	}
+	s.viewsMu.Unlock()
+	if !started {
+		return fmt.Errorf("miniblink 消息循环已退出")
+	}
+
+	errCh := make(chan error, 1)
+	if err := s.post(func() { errCh <- s.createWindow(url, allowLinks) }); err != nil {
+		return err
+	}
+	select {
+	case err := <-errCh:
+		return err
+	case <-time.After(3 * time.Second):
+		return fmt.Errorf("创建窗口超时")
+	}
+}
+
+// run 锁定单个 OS 线程完成 mbInit、创建首个窗口并驱动消息循环。
+func (s *mbSession) run(initialURL string, allowLinks bool) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	defer s.reset()
+
+	setMbDllDirectory(s.dllPath)
+	s.mb = syscall.NewLazyDLL(s.dllPath)
+	if err := s.mb.Load(); err != nil {
+		s.finishInit(fmt.Errorf("加载 %s 失败：%w（请确认 DLL 与 exe 位数一致、依赖齐全）", s.dllPath, err))
+		return
+	}
 	for _, name := range mbRequiredProcs {
-		if err := proc(name).Find(); err != nil {
-			return fmt.Errorf("mb132_x64.dll 缺少导出 %s：%w", name, err)
+		if err := s.proc(name).Find(); err != nil {
+			s.finishInit(fmt.Errorf("mb132_x64.dll 缺少导出 %s：%w", name, err))
+			return
 		}
 	}
-	// 下载回调在 Blink 线程调用 mbPopupDialogAndDownload，提前解析避免并发写 procs map
-	proc("mbPopupDialogAndDownload").Find()
-	// 可选导出：不同 miniblink 版本并不一定都提供
-	optional := func(name string, args ...uintptr) uintptr {
-		p := proc(name)
-		if err := p.Find(); err != nil {
-			return 0
+	// 这些导出在窗口回调或跨线程任务里使用，提前解析避免并发写 procs。
+	for _, name := range []string{
+		"mbPopupDialogAndDownload", "mbOnClose", "mbOnDestroy", "mbPostToUiThread",
+		"mbCallUiThreadAsync", "mbSetWindowTitleW", "mbGetHostHWND", "mbMoveToCenter",
+		"mbEnableHighDPISupport", "mbSetMbDllPath",
+	} {
+		s.proc(name).Find()
+	}
+
+	if p := utf16Arg(s.dllPath); p != 0 {
+		s.optionalCall("mbSetMbDllPath", p)
+	}
+	s.proc("mbInit").Call(0) // settings = nullptr
+	s.optionalCall("mbEnableHighDPISupport")
+
+	threadID, _, _ := procGetCurrentThreadId.Call()
+	s.viewsMu.Lock()
+	s.uiThreadID = uint32(threadID)
+	s.viewsMu.Unlock()
+
+	s.taskCB = mbNewCallback(func(_ uintptr, _ unsafe.Pointer) uintptr {
+		for {
+			s.taskMu.Lock()
+			if len(s.tasks) == 0 {
+				s.taskMu.Unlock()
+				return 0
+			}
+			fn := s.tasks[0]
+			s.tasks = s.tasks[1:]
+			s.taskMu.Unlock()
+			fn()
 		}
-		r, _, _ := p.Call(args...)
-		return r
+	})
+	// mbCloseCallback / mbDestroyCallback 都在 UI 线程回调，返回 1 表示允许关闭。
+	s.closeCB = mbNewCallback(func(view uintptr, _ unsafe.Pointer, _ unsafe.Pointer) uintptr {
+		// 关闭时先停止窗口逻辑；资源释放等 mbOnDestroy 确认内核已销毁视图。
+		s.windowGone(view)
+		return 1
+	})
+	s.destroyCB = mbNewCallback(func(view uintptr, _ unsafe.Pointer, _ unsafe.Pointer) uintptr {
+		s.windowGone(view)
+		s.releaseViewResources(view)
+		return 1
+	})
+
+	s.setStarted(true)
+	if err := s.createWindow(initialURL, allowLinks); err != nil {
+		s.setStarted(false)
+		s.finishInit(err)
+		return
 	}
+	s.finishInit(nil)
 
-	// miniblink132 SDK 通过 mbSetMbDllPath 指定 mb132_x64.dll 绝对路径；导出存在则按其方式设置
-	if p := utf16Arg(dllPath); p != 0 {
-		optional("mbSetMbDllPath", p)
-	}
+	s.proc("mbRunMessageLoop").Call()
+	s.setStarted(false)
+}
 
-	proc("mbInit").Call(0) // settings = nullptr
-	optional("mbEnableHighDPISupport")
-
+// createWindow 必须在 UI 线程调用；每个窗口使用独立的快捷键注册表。
+func (s *mbSession) createWindow(url string, allowLinks bool) error {
 	w, h := 1200, 800
 	if v, _, _ := procGetSystemMetrics.Call(smCXScreen); v > 0 && int(v)*4/5 >= 960 {
 		w = int(v) * 4 / 5
@@ -782,96 +1061,167 @@ func runMbWindow(dllPath, url, homeURL string, allowLinks bool) error {
 		h = int(v) * 4 / 5
 	}
 
-	view, _, _ := proc("mbCreateWebWindow").Call(
+	view, _, _ := s.proc("mbCreateWebWindow").Call(
 		mbWindowTypePopup, 0, 0, 0, uintptr(w), uintptr(h))
 	if view == 0 {
 		return fmt.Errorf("mbCreateWebWindow 创建窗口失败")
 	}
-	optional("mbMoveToCenter", view)
-	if p := utf16Arg(url); p != 0 {
-		optional("mbSetWindowTitleW", view, p)
+	res := newMbResourceSet()
+	shortcuts := newMbShortcutRegistry()
+	s.viewsMu.Lock()
+	if old := s.resources[view]; old != nil {
+		// 视图句柄被复用时，旧窗口的资源已不会再被使用。
+		old.release()
 	}
+	s.views[view] = true
+	s.resources[view] = res
+	s.shortcuts[view] = shortcuts
+	count := len(s.views)
+	s.viewsMu.Unlock()
+
+	s.optionalCall("mbMoveToCenter", view)
+	if p := res.utf16Arg(url); p != 0 {
+		s.optionalCall("mbSetWindowTitleW", view, p)
+	}
+	homeURL := s.homeURL
 	if homeURL == "" {
 		homeURL = url
 	}
 
-	// 快捷键里的 mb* 调用必须在 UI 线程执行，统一通过投递回调完成
-	postToUI := func(cb uintptr, name string) {
-		if p := proc("mbPostToUiThread"); p.Find() == nil {
-			p.Call(cb, 0)
-			return
-		}
-		if p := proc("mbCallUiThreadAsync"); p.Find() == nil {
-			p.Call(view, cb, 0, 0)
-			return
-		}
-		mbLogEvent("快捷键", fmt.Sprintf("当前 mb132_x64.dll 不支持线程投递，%s 未生效", name))
+	// mbOnClose / mbOnDestroy 是判断窗口关闭最可靠的来源；HWND 轮询仅作兜底。
+	if p := s.proc("mbOnClose"); p.Find() == nil {
+		p.Call(view, s.closeCB, 0)
 	}
-	goHomeCB := mbNewCallback(func(_ uintptr, _ unsafe.Pointer) uintptr {
+	if p := s.proc("mbOnDestroy"); p.Find() == nil {
+		p.Call(view, s.destroyCB, 0)
+	}
+
+	goHomeCB := res.callback(func(_ uintptr, _ unsafe.Pointer) uintptr {
 		b := append([]byte(homeURL), 0)
-		proc("mbLoadURL").Call(view, uintptr(unsafe.Pointer(&b[0])))
+		s.proc("mbLoadURL").Call(view, uintptr(unsafe.Pointer(&b[0])))
 		runtime.KeepAlive(b)
 		return 0
 	})
-	goBackCB := mbNewCallback(func(_ uintptr, _ unsafe.Pointer) uintptr {
-		optional("mbGoBack", view)
+	goBackCB := res.callback(func(_ uintptr, _ unsafe.Pointer) uintptr {
+		s.optionalCall("mbGoBack", view)
 		return 0
 	})
-	goForwardCB := mbNewCallback(func(_ uintptr, _ unsafe.Pointer) uintptr {
-		optional("mbGoForward", view)
+	goForwardCB := res.callback(func(_ uintptr, _ unsafe.Pointer) uintptr {
+		s.optionalCall("mbGoForward", view)
 		return 0
 	})
-	goReloadCB := mbNewCallback(func(_ uintptr, _ unsafe.Pointer) uintptr {
-		optional("mbReload", view)
+	goReloadCB := res.callback(func(_ uintptr, _ unsafe.Pointer) uintptr {
+		s.optionalCall("mbReload", view)
 		return 0
 	})
-	postGoHome := func() { postToUI(goHomeCB, "Ctrl+Home") }
-	postGoBack := func() { postToUI(goBackCB, "Alt+Left") }
-	postGoForward := func() { postToUI(goForwardCB, "Alt+Right") }
-	postReload := func() { postToUI(goReloadCB, "F5/Ctrl+R") }
+	shortcuts.add(mbModCtrl, vkHome, func() { s.postToUI(goHomeCB, view, "Ctrl+Home") }, "返回主进程端口页面")
+	shortcuts.add(mbModAlt, vkLeft, func() { s.postToUI(goBackCB, view, "Alt+Left") }, "后退")
+	shortcuts.add(mbModAlt, vkRight, func() { s.postToUI(goForwardCB, view, "Alt+Right") }, "前进")
+	shortcuts.add(0, vkF5, func() { s.postToUI(goReloadCB, view, "F5") }, "刷新当前页面")
+	shortcuts.add(mbModCtrl, vkR, func() { s.postToUI(goReloadCB, view, "Ctrl+R") }, "刷新当前页面")
 
-	// 快捷键集中注册：add 返回取消函数，可撤销单条；stop 停止全部监听
-	shortcuts := newMbShortcutRegistry()
-	shortcuts.add(mbModCtrl, vkHome, postGoHome, "返回主进程端口页面")
-	shortcuts.add(mbModAlt, vkLeft, postGoBack, "后退")
-	shortcuts.add(mbModAlt, vkRight, postGoForward, "前进")
-	shortcuts.add(0, vkF5, postReload, "刷新当前页面")
-	shortcuts.add(mbModCtrl, vkR, postReload, "刷新当前页面")
-
-	// 注册事件回调与链接跳转参数（必须在加载 URL 之前）
-	registerMbEvents(optional, view, allowLinks, url)
-	registerMbLinkCopy(proc, view)
-	if proc("mbOnDownloadInBlinkThread").Find() != nil {
+	registerMbEvents(s.optional, view, allowLinks, url, res)
+	registerMbLinkCopy(s.proc, view, res)
+	if s.proc("mbOnDownloadInBlinkThread").Find() != nil {
 		mbLogEvent("下载", "当前 mb132_x64.dll 不支持另存为下载回调，文件下载功能不可用")
 	}
-	mbLogEvent("窗口创建", fmt.Sprintf("句柄=%d 初始地址=%s 允许链接跳转=%v", view, url, allowLinks))
+	mbLogEvent("窗口创建", fmt.Sprintf("句柄=%d 地址=%s 当前窗口数=%d", view, url, count))
 
 	urlBytes := append([]byte(url), 0)
-	proc("mbLoadURL").Call(view, uintptr(unsafe.Pointer(&urlBytes[0])))
+	s.proc("mbLoadURL").Call(view, uintptr(unsafe.Pointer(&urlBytes[0])))
 	runtime.KeepAlive(urlBytes)
-	proc("mbShowWindow").Call(view, 1)
+	s.proc("mbShowWindow").Call(view, 1)
 
-	// 窗口被关闭时向 UI 线程投递 WM_QUIT，让 mbRunMessageLoop 返回，
-	// 主程序随窗口一起退出，避免服务残留在后台。
-	if hwnd := optional("mbGetHostHWND", view); hwnd != 0 {
-		mbLogEvent("按键监听", fmt.Sprintf("窗口句柄=%d，按键信息将输出到控制台（快捷键可增删/取消）", hwnd))
+	if hwnd := s.optionalCall("mbGetHostHWND", view); hwnd != 0 {
+		mbLogEvent("按键监听", fmt.Sprintf("窗口句柄=%d，快捷键 Ctrl+Home / Alt+Left / Alt+Right / F5 已启用", hwnd))
 		go monitorMbKeys(hwnd, shortcuts)
-		threadID, _, _ := procGetCurrentThreadId.Call()
-		go func() {
-			t := time.NewTicker(200 * time.Millisecond)
-			defer t.Stop()
-			for range t.C {
-				if alive, _, _ := procIsWindow.Call(hwnd); alive == 0 {
-					shortcuts.stop()
-					procPostThreadMessageW.Call(uintptr(uint32(threadID)), wmQuit, 0, 0)
-					// 个别版本的 mbRunMessageLoop 不理会 WM_QUIT，兜底确保进程退出
-					time.AfterFunc(1*time.Second, func() { exitMain(0) })
-					return
-				}
-			}
-		}()
+		go s.watchWindow(view, hwnd, shortcuts)
+	}
+	return nil
+}
+
+func (s *mbSession) windowGone(view uintptr) {
+	s.viewsMu.Lock()
+	if !s.views[view] {
+		s.viewsMu.Unlock()
+		return
+	}
+	delete(s.views, view)
+	n := len(s.views)
+	if n == 0 {
+		s.stopping = true
+	}
+	shortcuts := s.shortcuts[view]
+	delete(s.shortcuts, view)
+	s.viewsMu.Unlock()
+
+	if shortcuts != nil {
+		shortcuts.stop()
 	}
 
-	proc("mbRunMessageLoop").Call()
-	return nil
+	mbLogEvent("窗口关闭", fmt.Sprintf("句柄=%d 剩余窗口数=%d", view, n))
+	if n == 0 {
+		s.scheduleQuit()
+	}
+}
+
+// releaseViewResources 在内核确认视图销毁后释放该窗口独有的字符串与回调。
+func (s *mbSession) releaseViewResources(view uintptr) {
+	s.viewsMu.Lock()
+	res := s.resources[view]
+	delete(s.resources, view)
+	s.viewsMu.Unlock()
+	if res == nil {
+		return
+	}
+	// 给 C 侧尚未返回的回调留出缓冲，再丢弃引用并触发回收。
+	time.AfterFunc(mbResourceReleaseDelay, func() {
+		res.release()
+		runtime.GC()
+		debug.FreeOSMemory()
+		mbLogEvent("资源清理", fmt.Sprintf("句柄=%d 已释放窗口资源", view))
+	})
+}
+
+// scheduleQuit 延迟确认窗口数：期间若有新窗口打开则取消退出。
+func (s *mbSession) scheduleQuit() {
+	s.viewsMu.Lock()
+	if s.quitTimer != nil {
+		s.quitTimer.Stop()
+	}
+	s.quitTimer = time.AfterFunc(mbQuitGrace, func() {
+		s.viewsMu.Lock()
+		empty := len(s.views) == 0 && s.started
+		threadID := s.uiThreadID
+		s.viewsMu.Unlock()
+		if !empty {
+			return
+		}
+		notifyMbAllClosed()
+		procPostThreadMessageW.Call(uintptr(threadID), wmQuit, 0, 0)
+		// 个别版本的 mbRunMessageLoop 不理会 WM_QUIT，兜底确保进程退出。
+		time.AfterFunc(time.Second, func() { exitMain(0) })
+	})
+	s.viewsMu.Unlock()
+}
+
+func (s *mbSession) watchWindow(view, hwnd uintptr, shortcuts *mbShortcutRegistry) {
+	t := time.NewTicker(200 * time.Millisecond)
+	defer t.Stop()
+	for range t.C {
+		s.viewsMu.Lock()
+		started := s.started
+		_, exists := s.views[view]
+		s.viewsMu.Unlock()
+		if !started || !exists {
+			shortcuts.stop()
+			return
+		}
+		if alive, _, _ := procIsWindow.Call(hwnd); alive == 0 {
+			shortcuts.stop()
+			s.windowGone(view)
+			s.releaseViewResources(view)
+			return
+		}
+	}
 }

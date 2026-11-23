@@ -1,0 +1,3 @@
+必应翻译,800x600,https://cn.bing.com/translator?setmkt=zh-cn&setlang=zh-cn
+百度汉语,800x600,https://dict.baidu.com/
+百度地图,800x600,https://map.baidu.com/

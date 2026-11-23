@@ -14,7 +14,10 @@
 @REM aria2c.exe --enable-rpc=true --rpc-allow-origin-all=true  --rpc-listen-port=6800 --dir=./aria2c/ --save-session-interval=20 --save-session=./.aria2c/.session
 @REM https://gh-proxy.com/github.com/aria2/aria2/releases/download/release-1.37.0/aria2-1.37.0-win-64bit-build1.zip
 @REM ###################################################### 
+REM go install github.com/tc-hib/go-winres@latest
+REM go-winres make
+@REM ###################################################### 
 @REM go build -ldflags="-s -w"  && dir && webipscan.exe -d --url http://127.0.0.1:9100
 @REM go build -ldflags="-s -w"  && dir && webipscan.exe -d --url http://127.0.0.1:9100
-go build -ldflags="-s -w"  && dir && webipscan -d --url http://127.0.0.1:9100
-
+REM go build -ldflags="-s -w"  && dir && webipscan --user -d --url http://127.0.0.1:9801
+go build -ldflags="-s -w"  && dir && webipscan --user -d 

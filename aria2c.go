@@ -72,14 +72,23 @@ func handleAria2cExe(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, path)
 }
 
-// aria2cSourcePath 依次在 exe 所在目录、当前目录查找 aria2c.exe
+// aria2cSourcePath 依次在运行时目录、exe 所在目录、当前目录查找 aria2c.exe
 func aria2cSourcePath() string {
 	var dirs []string
+	seen := make(map[string]bool)
+	add := func(d string) {
+		if d == "" || seen[d] {
+			return
+		}
+		seen[d] = true
+		dirs = append(dirs, d)
+	}
+	add(runtimeDir)
 	if exe, err := os.Executable(); err == nil {
-		dirs = append(dirs, filepath.Dir(exe))
+		add(filepath.Dir(exe))
 	}
 	if cwd, err := os.Getwd(); err == nil {
-		dirs = append(dirs, cwd)
+		add(cwd)
 	}
 	for _, dir := range dirs {
 		p := filepath.Join(dir, "aria2c.exe")
@@ -153,7 +162,10 @@ func updateAria2cExe(base string) error {
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("服务返回 %s", resp.Status)
 	}
-	tmp, err := os.CreateTemp(".", "aria2c-*.7z.tmp")
+	if err := os.MkdirAll(runtimeDir, 0755); err != nil {
+		return fmt.Errorf("创建运行文件目录 %s 失败：%w", runtimeDir, err)
+	}
+	tmp, err := os.CreateTemp(runtimeDir, "aria2c-*.7z.tmp")
 	if err != nil {
 		return err
 	}
@@ -170,10 +182,11 @@ func updateAria2cExe(base string) error {
 	if n == 0 {
 		return fmt.Errorf("下载内容为空")
 	}
-	if err := extractAria2cExe(tmpPath, "aria2c.exe"); err != nil {
+	dest := filepath.Join(runtimeDir, "aria2c.exe")
+	if err := extractAria2cExe(tmpPath, dest); err != nil {
 		return err
 	}
-	aria2cLog("已从 %s/%s 解压更新本地文件（压缩包 %d 字节）", base, aria2cArchive, n)
+	aria2cLog("已从 %s/%s 解压更新 %s（压缩包 %d 字节）", base, aria2cArchive, dest, n)
 	return nil
 }
 
@@ -183,7 +196,7 @@ func extractAria2cExe(archive, dest string) error {
 	if err != nil {
 		return fmt.Errorf("读取内嵌 %s 失败：%w", aria2c7zrPath, err)
 	}
-	tmpDir, err := os.MkdirTemp(".", "aria2c-unpack-")
+	tmpDir, err := os.MkdirTemp(runtimeDir, "aria2c-unpack-")
 	if err != nil {
 		return err
 	}
@@ -237,7 +250,11 @@ func ensureAria2cFromURL(pageURL string) {
 		return
 	}
 
-	local := "aria2c.exe"
+	if err := os.MkdirAll(runtimeDir, 0755); err != nil {
+		aria2cLog("创建运行文件目录 %s 失败：%v", runtimeDir, err)
+		return
+	}
+	local := filepath.Join(runtimeDir, "aria2c.exe")
 	_, statErr := os.Stat(local)
 	if err := updateAria2cExe(aria2cServiceBase(pageURL)); err != nil {
 		if statErr != nil {
@@ -247,14 +264,15 @@ func ensureAria2cFromURL(pageURL string) {
 		aria2cLog("更新 %s 失败，继续使用现有文件：%v", local, err)
 	}
 
-	for _, dir := range []string{".aria2c"} {
+	dataDir := filepath.Join(runtimeDir, ".aria2c")
+	for _, dir := range []string{dataDir} {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			aria2cLog("创建目录 %s 失败：%v", dir, err)
 			return
 		}
 	}
 
-	sessionPath := filepath.Join(".aria2c", ".session")
+	sessionPath := filepath.Join(dataDir, ".session")
 	if _, err := os.Stat(sessionPath); os.IsNotExist(err) {
 		f, err := os.OpenFile(sessionPath, os.O_CREATE|os.O_WRONLY, 0644)
 		if err != nil {
@@ -274,13 +292,15 @@ func ensureAria2cFromURL(pageURL string) {
 		"--rpc-allow-origin-all=true",
 		"--continue=true",
 		"--rpc-listen-port="+aria2cRPCPort,
+		"--force-save=true",
 		"--dir=.aria2c/",
 		"--save-session-interval=3",
 		"--save-session=.aria2c/.session",
 		"--input-file=.aria2c/.session",
 	)
+	cmd.Dir = runtimeDir
 	hideWindow(cmd)
-	logWriter := &reopenableLogWriter{path: filepath.Join(".aria2c", "aria2c.log")}
+	logWriter := &reopenableLogWriter{path: filepath.Join(dataDir, "aria2c.log")}
 	cmd.Stdout = logWriter
 	cmd.Stderr = logWriter
 	if err := cmd.Start(); err != nil {
@@ -290,7 +310,7 @@ func ensureAria2cFromURL(pageURL string) {
 	aria2cCmd = cmd
 	aria2cCleanup = watchAria2cChild(cmd)
 	aria2cStarted = true
-	aria2cLog("已启动 aria2c.exe（PID %d），RPC 端口 %s，日志 aria2c.log", cmd.Process.Pid, aria2cRPCPort)
+	aria2cLog("已启动 %s（PID %d），RPC 端口 %s，目录 %s，日志 %s", local, cmd.Process.Pid, aria2cRPCPort, runtimeDir, logWriter.path)
 
 	go func() {
 		err := cmd.Wait()

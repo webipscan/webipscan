@@ -22,16 +22,33 @@ go build -ldflags="-s -w" -o ipscan.exe .
 |---|---|
 | `-p <端口>` / `--port <端口>` / 位置参数 | 指定监听端口，被占用时仍自动向上顺延 |
 | `--daemon` / `-d` / `--noopen` / `-n` | 不隐藏控制台窗口，也不打开浏览器或 miniblink 窗口；服务保持运行，按 `Ctrl+C` 停止 |
-| `--url <地址>` / `--url=<地址>` | 仅在存在可用 `mb132_x64.dll` 时生效：用 `runMbWindow` 打开该地址（可与 `-d` 同用，此时控制台仍保留） |
+| `--url <地址>` / `--url=<地址>` | 仅在存在可用 `mb132_x64.dll` 时生效：用内嵌内核窗口打开该地址（可与 `-d` 同用，此时控制台仍保留） |
 | `--no-links` | 禁止 miniblink 窗口内点击链接/提交表单跳转；默认允许，并且链接会在当前窗口跳转 |
+| `--no-tray` | 不创建系统托盘（默认在 Windows 桌面会话中自动创建） |
+| `--user` / `--user-mode` | 显式声明用户模式（默认已开启，保留兼容） |
+| `--no-user` / `--no-user-mode` | 关闭用户模式，`aria2c.exe`、`mb132_x64.dll` 改回 exe 所在目录释放与加载 |
 
-启动后**自动用默认浏览器打开页面**，控制台同时打印本机全部 IP。按 `Ctrl+C` 停止。
+**用户模式（默认）**：不带任何参数启动也进入用户模式。主启动目录为 `%USERPROFILE%\<当前 exe 文件名（去掉扩展名）>`，例如 `webipscan.exe` 对应 `%USERPROFILE%\webipscan`。`aria2c.exe` 与 `mb132_x64.dll` 的释放目录和加载目录统一为该目录，DLL 的搜索目录也随其路径切换；`aria2c` 的会话、日志与下载目录位于其下的 `.aria2c`。控制台启动横幅会打印当前运行模式与目录。可用 `--no-user` / `--no-user-mode` 或环境变量 `WEBIPSCAN_USER_MODE=0` 关闭；用户目录不可用时自动退回 exe 目录。
+
+启动后按当前环境自动打开页面：有可用的 `mb132_x64.dll` 时用内嵌内核窗口，否则用默认浏览器；控制台同时打印本机全部 IP。按 `Ctrl+C` 停止。
+
+**Windows 系统托盘**：程序会检测当前是否处于可交互的 Windows 桌面会话（WinSta0 且可打开输入桌面）；服务会话、非 Windows 平台自动跳过。托盘直接从内嵌的 `static/icon.ico` 加载图标，exe 图标由同一文件生成的 `icon_*.syso` 资源提供（生成命令：`go run tools/make_icon.go`）。右键托盘图标可打开菜单：
+
+- 打开主页 / 打开网络剪贴板（有可用内核时用内嵌窗口，否则回退系统浏览器；可同时打开多个窗口）
+- 打开 aria2c 页面（AriaNg，打开前确保 aria2c RPC 就绪）
+- 工具（优先从 `tools.txt` 读取并与内置列表去重合并，内置含必应翻译、百度汉语、百度地图、Golang 库；总菜单项少于 32 个时平铺，否则放入“工具”子菜单）
+- 复制访问地址（写入系统剪贴板）
+- 显示控制台 / 隐藏控制台
+- 关于 ipscan（版本、地址、exe 路径）
+- 退出（走统一清理流程后结束进程）
+
+双击托盘图标可直接打开主页。
 
 页面快捷键：`Ctrl + G` 弹出网址输入框，回车后在页内 iframe 打开该地址（省略协议时默认 `http://`，
 仅允许 http/https）；`Ctrl + Home` 退出页内浏览并回到本地服务默认页面。若目标站点设置了
 `X-Frame-Options` 等限制而无法内嵌，可点击工具栏「新窗口打开」。
 
-**可选 miniblink 窗口**：若当前目录（或 exe 所在目录）存在**可正常加载、必需导出齐全**的 `mb132_x64.dll`，则不再打开系统浏览器，而是按 [miniblink](https://github.com/weolar/miniblink49) 的 `mb.h` 纯 C 接口动态加载 `mb132_x64.dll`，创建原生 Windows 窗口显示 `http://127.0.0.1:<端口>`：自动**隐藏本进程的控制台窗口**，**关闭窗口即结束整个进程**。若控制台被启动它的 cmd/PowerShell 共用，则让本进程 `FreeConsole` 脱离控制台（同样不再显示黑框，但不会把用户终端一起隐藏）。`mb132_x64.dll` 及其依赖（如 `mb132_x64.dll` / `mb132_x32.dll`）需与 exe 位数一致并放在同一目录；DLL 缺失、位数不符、导出不全或初始化失败时会自动恢复控制台并回退到系统默认浏览器。
+**可选 miniblink 窗口**：若当前目录（或 exe 所在目录）存在**可正常加载、必需导出齐全**的 `mb132_x64.dll`，则不再打开系统浏览器，而是按 [miniblink](https://github.com/weolar/miniblink49) 的 `mb.h` 纯 C 接口动态加载 `mb132_x64.dll`，创建原生 Windows 窗口显示 `http://127.0.0.1:<端口>`：自动**隐藏本进程的控制台窗口**；启动窗口与托盘菜单打开的窗口共享同一内核会话，**最后一个窗口关闭后结束整个进程**。若控制台被启动它的 cmd/PowerShell 共用，则让本进程 `FreeConsole` 脱离控制台（同样不再显示黑框，但不会把用户终端一起隐藏）。`mb132_x64.dll` 及其依赖（如 `mb132_x64.dll` / `mb132_x32.dll`）需与 exe 位数一致并放在同一目录；DLL 缺失、位数不符、导出不全或初始化失败时会自动恢复控制台并回退到系统默认浏览器。
 
 miniblink 窗口运行期间，**标题变化、地址变化、加载完成/失败、导航（含链接点击）、页面控制台
 和窗口按键（含 Ctrl/Shift/Alt/Win 组合）**会实时输出到主控制台（`[mb 时间] 事件: 内容`），
@@ -39,7 +56,7 @@ miniblink 窗口运行期间，**标题变化、地址变化、加载完成/失�
 由内核完成下载，下载开始、进度（每 1 MB）、保存路径与结果同样输出到控制台；需要 `mb132_x64.dll` 导出
 `mbOnDownloadInBlinkThread` / `mbPopupDialogAndDownload`，否则会在控制台提示该功能不可用。
 默认允许点击链接并在当前窗口跳转；如需禁用可用 `--no-links`。
-加载本机 `AriaNg.html` 时，程序会检查系统是否已有 `aria2c` 进程以及 6800 端口是否被占用；两者都空闲时才从当前服务的 `/aria2c.exe` 更新当前目录下的 `aria2c.exe`，创建 `aria2c` 与 `.aria2c` 目录，并以后台子进程启动 RPC（`--enable-rpc` / `--rpc-listen-port=6800` / `--dir=./aria2c/` / `--save-session=./.aria2c/.session` 等），子进程控制台输出写入 `aria2c.log`。已有进程或端口被占用时只输出提示，不会重复启动。
+加载本机 `AriaNg.html` 时，程序会检查系统是否已有 `aria2c` 进程以及 6800 端口是否被占用；两者都空闲时才从当前服务的 `/aria2c.7z` 解压更新运行时目录下的 `aria2c.exe`（用户模式下为 `%USERPROFILE%\<exe 文件名>`），在该目录下创建 `.aria2c` 会话目录，并以运行时目录为工作目录后台启动 RPC（`--enable-rpc` / `--rpc-listen-port=6800` / `--dir=.aria2c/` / `--save-session=.aria2c/.session` 等），子进程控制台输出写入 `.aria2c/aria2c.log`。已有进程或端口被占用时只输出提示，不会重复启动。
 mb 窗口标题显示当前页面 URL（本机页面保留网页标题）；按 `Ctrl + Home` 可返回主进程端口页面（`http://127.0.0.1:<端口>`），`Alt + Left` / `Alt + Right` 分别为后退 / 前进，`F5` / `Ctrl + R` 为刷新。这些快捷键在 `mb_windows.go` 的 `mbShortcutRegistry` 中集中注册：继续调用 `add` 即可添加更多组合，`add` 返回的取消函数可撤销单条，`stop()` 可停止整个按键监听。
 
 **端口被占用时自动顺延**：默认端口为 **9100**。若指定端口（或默认 9100）已被占用，程序会**逐端口向上检测**（9101、9102…最多再试 99 次），找到第一个可用端口后启动，并在控制台打印占用者与最终使用的端口：
@@ -203,6 +220,7 @@ mb 窗口标题显示当前页面 URL（本机页面保留网页标题）；按 
 ```
 ipscan/
 ├── main.go            HTTP 服务、SSE 推送、端口避让、本机网段探测
+├── runtime_dir.go     运行时目录解析（用户模式 -> %USERPROFILE%\<exe 文件名>）
 ├── scanner.go         CIDR 展开、TCP/ICMP 探测、ARP、OUI 厂商库、本机网卡枚举
 ├── portscan.go        指定主机端口扫描（端口表达式解析、目标解析、SSE 推送、横幅/标题抓取）
 ├── ms17010.go         445 开放时的 MS17-010 非利用式检测（SMBv1 PeekNamedPipe）
@@ -215,8 +233,17 @@ ipscan/
 ├── clipboard.go       网络剪贴板信令：SDP 链接信息暂存/过期/删除，不保存任何内容
 ├── qrcode.go          纯标准库二维码编码（Byte 模式 / 纠错 L / 版本 1-6）与 SVG 输出
 ├── browser.go         调用系统默认浏览器 + 检测当前目录是否含 mb132_x64.dll（Windows 用 rundll32，不闪黑框）
-├── mb_windows.go      动态加载 mb132_x64.dll，创建 miniblink 原生窗口显示本服务页面（Windows）
+├── mb_windows.go      动态加载 mb132_x64.dll，管理共享 UI 线程上的多个 miniblink 窗口（Windows）
 ├── mb_other.go        非 Windows 平台占位
+├── tray.go            托盘命令所需的运行时配置
+├── tools_config.go    读取 tools.txt 中的工具地址
+├── tools.txt          工具菜单配置（名称,尺寸,地址）
+├── tray_windows.go    Windows 桌面检测、系统托盘、右键菜单与各菜单命令函数
+├── tray_other.go      非 Windows 平台托盘占位
+├── static/icon.ico    刺猬图标（托盘与 exe 共用）
+├── internal/winicon   ICO 转 Windows 可用 DIB 图标（供资源生成使用）
+├── tools/make_icon.go 由 icon.ico 生成 icon_*.syso 资源（已生成，常规构建无需运行）
+├── icon_*.syso        exe 图标资源（Go 构建自动链接）
 ├── exec_windows.go    隐藏子进程窗口（Windows）
 ├── exec_other.go      非 Windows 平台占位
 ├── static/index.html  前端页面（网格 + 列表 + 统计 + 导出 + 指定主机探测）

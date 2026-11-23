@@ -61,14 +61,14 @@ document.addEventListener('contextmenu', function(e){
 })();`
 
 // registerMbLinkCopy 在 Blink 线程的 document-ready 回调里注入脚本，覆盖所有 frame（含跨域 iframe）。
-func registerMbLinkCopy(proc func(string) *syscall.LazyProc, view uintptr) {
+func registerMbLinkCopy(proc func(string) *syscall.LazyProc, view uintptr, res *mbResourceSet) {
 	docReady := proc("mbOnDocumentReadyInBlinkThread")
 	runJS := proc("mbRunJsSync")
 	if docReady.Find() != nil || runJS.Find() != nil {
 		mbLogEvent("链接复制", "当前 mb132_x64.dll 不支持脚本注入，右键复制 a 链接地址不可用")
 		return
 	}
-	cb := mbNewCallback(func(_ uintptr, _ unsafe.Pointer, frame uintptr) uintptr {
+	cb := res.callback(func(_ uintptr, _ unsafe.Pointer, frame uintptr) uintptr {
 		script := append([]byte(mbLinkCopyJS), 0)
 		runJS.Call(view, frame, uintptr(unsafe.Pointer(&script[0])), 0)
 		runtime.KeepAlive(script)

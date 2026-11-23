@@ -39,36 +39,35 @@ func fileSHA256(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// ensureMbDll 确保 exe 目录下存在哈希正确的 mb132_x64.dll。
+// ensureMbDll 确保运行时目录下存在哈希正确的 mb132_x64.dll。
+// 用户模式下该目录为 %USERPROFILE%\webipscan，否则为 exe 所在目录。
 // 文件缺失或哈希不符时，从内嵌的 7z 资源解压覆盖；成功返回 DLL 绝对路径。
 func ensureMbDll() (string, error) {
-	exe, err := os.Executable()
-	if err != nil {
-		return "", fmt.Errorf("获取 exe 路径失败：%w", err)
+	if err := os.MkdirAll(runtimeDir, 0755); err != nil {
+		return "", fmt.Errorf("创建运行文件目录 %s 失败：%w", runtimeDir, err)
 	}
-	exeDir := filepath.Dir(exe)
-	dllPath := filepath.Join(exeDir, mbDllName)
+	dllPath := filepath.Join(runtimeDir, mbDllName)
 
 	if sum, err := fileSHA256(dllPath); err == nil && sum == mbExpectedSHA256 {
 		return dllPath, nil
 	}
 
-	if err := extractMbDll(exeDir, dllPath); err != nil {
+	if err := extractMbDll(runtimeDir, dllPath); err != nil {
 		return "", err
 	}
 	return dllPath, nil
 }
 
-// extractMbDll 从 embed 资源释放 7z 到临时文件，解压到 exeDir，并校验结果
-func extractMbDll(exeDir, dllPath string) error {
+// extractMbDll 从 embed 资源释放 7z 到临时文件，解压到 destDir，并校验结果
+func extractMbDll(destDir, dllPath string) error {
 	data, err := staticFS.ReadFile(mbArchivePath)
 	if err != nil {
 		return fmt.Errorf("读取内嵌 %s 失败：%w", mbArchivePath, err)
 	}
 
-	tmp, err := os.CreateTemp(exeDir, "mb132-*.7z")
+	tmp, err := os.CreateTemp(destDir, "mb132-*.7z")
 	if err != nil {
-		return fmt.Errorf("在 exe 目录创建临时压缩包失败：%w", err)
+		return fmt.Errorf("在目录 %s 创建临时压缩包失败：%w", destDir, err)
 	}
 	tmpPath := tmp.Name()
 	if _, err := tmp.Write(data); err != nil {
@@ -79,7 +78,7 @@ func extractMbDll(exeDir, dllPath string) error {
 		return fmt.Errorf("关闭临时压缩包失败：%w", err)
 	}
 
-	if err := unzipMbArchive(tmpPath, exeDir); err != nil {
+	if err := unzipMbArchive(tmpPath, destDir); err != nil {
 		return err
 	}
 

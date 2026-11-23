@@ -1,0 +1,4 @@
+https://github.com/mpv-player/mpv/releases/download/v0.42.0/libmpv-v0.42.0-x86_64-w64-mingw32-lgpl.zip
+
+webipscan\libmpv-2.dll
+https://github.com/zhongfly/mpv-winbuild/releases/download/2026-11-22-da09f092ad/mpv-dev-x86_64-v3-20261122-git-da09f092ad.7z

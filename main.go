@@ -29,7 +29,7 @@ var staticRoot, _ = fs.Sub(staticFS, "static")
 
 const (
 	// defaultPort 默认监听端口
-	defaultPort = "9100"
+	defaultPort = "9801"
 	// maxPortAttempts 端口被占用时向上探测的最大次数
 	maxPortAttempts = 100
 )
@@ -182,6 +182,9 @@ type launchOptions struct {
 	port      string
 	noOpen    bool   // --daemon / -d / --noopen / -n：不隐藏控制台、不打开浏览器
 	noLinks   bool   // --no-links：禁止 miniblink 窗口内点击链接跳转
+	noTray    bool   // --no-tray：即使处于 Windows 桌面也不创建托盘
+	userMode  bool   // --user / --user-mode：显式声明用户模式（默认已开启，保留兼容）
+	noUser    bool   // --no-user / --no-user-mode：关闭用户模式，改回 exe 所在目录
 	targetURL string // --url：存在 mb132_x64.dll 时用 miniblink 打开该地址
 }
 
@@ -202,6 +205,13 @@ func parseLaunchArgs(args []string) (launchOptions, error) {
 			o.noOpen = true
 		case a == "--no-links":
 			o.noLinks = true
+		case a == "--no-tray":
+			o.noTray = true
+		case a == "--user" || a == "--user-mode":
+			o.userMode = true
+		case a == "--no-user" || a == "--no-user-mode":
+			o.noUser = true
+			o.userMode = false
 		case a == "-p" || a == "--port":
 			v, err := next(&i, a)
 			if err != nil {
@@ -235,10 +245,13 @@ func main() {
 	opts, err := parseLaunchArgs(os.Args[1:])
 	if err != nil {
 		fmt.Println("启动参数错误：" + err.Error())
-		fmt.Println("用法：webipscan.exe [-p 端口] [--daemon|-d|--noopen|-n] [--url 地址] [--no-links]")
+		fmt.Println("用法：webipscan.exe [-p 端口] [--daemon|-d|--noopen|-n] [--url 地址] [--no-links] [--no-tray] [--user|--user-mode] [--no-user|--no-user-mode]")
 		exitMain(1)
 		return
 	}
+
+	// 默认用户模式：目录为 %USERPROFILE%\<exe 文件名>，仅 --no-user 时回退 exe 目录
+	initRuntimeDir(opts.noUser && !opts.userMode)
 
 	// Ctrl+C / SIGTERM 也走统一退出入口，确保关闭 aria2c 子进程
 	sigCh := make(chan os.Signal, 1)
@@ -301,6 +314,7 @@ func main() {
 
 	fmt.Println("==============================================")
 	fmt.Println("  局域网 IP 占用查询工具")
+	fmt.Println("  运行模式: " + runtimeDirLabel())
 	fmt.Println("  访问地址: " + url)
 	if actual != port {
 		fmt.Printf("  !! 端口 %s 不可用，已自动改用 %s\n", port, actual)
@@ -326,7 +340,7 @@ func main() {
 	case !showUI:
 		fmt.Println("  无窗口模式：不隐藏控制台、不打开浏览器（按 Ctrl+C 停止）")
 	case mbPath != "":
-		fmt.Println("  页面显示：miniblink 窗口（控制台已隐藏），关闭窗口即退出程序")
+		fmt.Println("  页面显示：miniblink 窗口（控制台已隐藏），关闭所有窗口即退出程序")
 	default:
 		fmt.Println("  浏览器已自动打开，按 Ctrl+C 停止")
 	}
@@ -335,41 +349,69 @@ func main() {
 	}
 	fmt.Println("==============================================")
 
-	// HTTP 服务放到后台：miniblink 模式下主 goroutine 要跑 Windows 消息循环
+	// Windows 桌面会话下创建系统托盘；服务会话或非 Windows 平台自动跳过
+	tools := loadTools()
+	if !opts.noTray {
+		if startTrayIfDesktop(trayConfig{
+			homeURL:      url,
+			clipboardURL: url + "/clip.html",
+			aria2cURL:    url + "/AriaNg.html",
+			tools:        tools,
+			version:      AppVersion,
+			mbDLL:        mbPath,
+		}) {
+			fmt.Printf("  系统托盘已启用（右键菜单：主页 / 剪贴板 / aria2c")
+			if len(tools) > 0 {
+				fmt.Printf(" / 工具(%d)", len(tools))
+			}
+			fmt.Println(" / 地址 / 控制台 / 关于 / 退出）")
+		}
+	}
+
+	// HTTP 服务放到后台：miniblink 消息循环运行在独立的 UI 线程上。
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- http.Serve(ln, nil) }()
 
 	// 等服务就绪后再拉起页面
 	time.Sleep(400 * time.Millisecond)
+	mbStarted := false
 	if mbPath != "" && (showUI || opts.targetURL != "") {
-		err := runMbWindow(mbPath, openURL, url, !opts.noLinks)
-		if err == nil {
-			fmt.Println("  mb 窗口已关闭，程序退出")
-			exitMain(0)
-		}
-		// 初始化/创建窗口失败：恢复控制台让错误信息可见
-		setConsoleVisible(true)
-		fmt.Println("  miniblink 窗口启动失败：" + err.Error())
-		if showUI {
-			fmt.Println("  改用默认浏览器打开本地页面")
+		if err := startMbWindow(mbPath, openURL, url, !opts.noLinks); err != nil {
+			// 初始化/创建窗口失败：恢复控制台让错误信息可见
+			setConsoleVisible(true)
+			fmt.Println("  miniblink 窗口启动失败：" + err.Error())
+			if showUI {
+				fmt.Println("  改用默认浏览器打开本地页面")
+			} else {
+				fmt.Println("  无窗口模式下保持服务运行")
+			}
+			openURL = url
 		} else {
-			fmt.Println("  无窗口模式下保持服务运行")
+			mbStarted = true
 		}
-		openURL = url
 	}
-	if showUI {
+	if !mbStarted && showUI {
 		if err := openBrowser(openURL); err != nil {
 			fmt.Println("  自动打开页面失败：" + err.Error())
 		}
 	}
-	if err := <-serveErr; err != nil {
-		log.Println(err)
+
+	// 托盘命令打开的内嵌窗口与启动窗口共享会话；最后一个窗口关闭时退出。
+	select {
+	case <-mbAllClosed():
+		fmt.Println("  所有 miniblink 窗口已关闭，程序退出")
+		exitMain(0)
+	case err := <-serveErr:
+		if err != nil {
+			log.Println(err)
+		}
 	}
 	exitMain(1)
 }
 
-// exitMain 统一退出入口：先关闭由本程序启动的 aria2c，再退出进程。
+// exitMain 统一退出入口：先清理托盘图标，再关闭由本程序启动的 aria2c，最后退出进程。
 func exitMain(code int) {
+	stopTrayIfActive()
 	shutdownAria2c()
 	clipShutdown()
 	os.Exit(code)
