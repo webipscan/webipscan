@@ -6,6 +6,7 @@ import (
 	_ "embed"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -54,7 +55,7 @@ const (
 
 // 固定菜单项数量（不含分隔符）与一级菜单项上限。
 const (
-	fixedTrayMenuItems = 8
+	fixedTrayMenuItems = 9
 	maxFlatTrayItems   = 32
 )
 
@@ -63,6 +64,7 @@ const (
 	cmdTrayOpenHome = iota + 1001
 	cmdTrayOpenClipboard
 	cmdTrayOpenAria2c
+	cmdTrayOpenPlayer
 	cmdTrayCopyAddress
 	cmdTrayShowConsole
 	cmdTrayHideConsole
@@ -218,6 +220,7 @@ func startTrayIfDesktop(cfg trayConfig) bool {
 	app.actions[cmdTrayOpenHome] = app.commandOpenHome
 	app.actions[cmdTrayOpenClipboard] = app.commandOpenClipboard
 	app.actions[cmdTrayOpenAria2c] = app.commandOpenAria2c
+	app.actions[cmdTrayOpenPlayer] = app.commandOpenPlayer
 	app.actions[cmdTrayCopyAddress] = app.commandCopyAddress
 	app.actions[cmdTrayShowConsole] = app.commandShowConsole
 	app.actions[cmdTrayHideConsole] = app.commandHideConsole
@@ -225,7 +228,7 @@ func startTrayIfDesktop(cfg trayConfig) bool {
 	app.actions[cmdTrayExit] = app.commandExit
 	for i, tool := range app.cfg.tools {
 		t := tool
-		app.actions[uint32(cmdTrayToolBase+i)] = func() { app.openWindow(t.URL) }
+		app.actions[uint32(cmdTrayToolBase+i)] = func() { app.openTool(t) }
 	}
 
 	trayStateMu.Lock()
@@ -354,6 +357,13 @@ func (a *trayApp) cleanup() {
 	})
 }
 
+// trayActive 判断当前进程是否启用了托盘；窗口全部关闭时据此决定是否退出。
+func trayActive() bool {
+	trayStateMu.Lock()
+	defer trayStateMu.Unlock()
+	return activeTray != nil
+}
+
 // stopTrayIfActive 在进程退出前通知托盘线程结束并清理图标；
 // 若托盘线程未能及时响应，则直接清理，确保 os.Exit 前图标已移除。
 func stopTrayIfActive() {
@@ -460,8 +470,6 @@ func (a *trayApp) showMenu() {
 	}
 
 	appendItem(cmdTrayOpenHome, "打开主页")
-	appendItem(cmdTrayOpenClipboard, "打开网络剪贴板")
-	appendItem(cmdTrayOpenAria2c, "打开 aria2c 页面")
 	if len(a.cfg.tools) > 0 {
 		if fixedTrayMenuItems+len(a.cfg.tools) < maxFlatTrayItems {
 			// 菜单项不多时直接平铺，减少一次子菜单操作。
@@ -482,10 +490,16 @@ func (a *trayApp) showMenu() {
 			runtime.KeepAlive(label)
 		}
 	}
-	appendItem(cmdTrayCopyAddress, "复制访问地址")
+
+	procAppendMenuW.Call(hMenu, mfSeparator, 0, 0)
+	appendItem(cmdTrayOpenClipboard, "打开网络剪贴板")
+	appendItem(cmdTrayOpenAria2c, "打开 aria2c 页面")
+	appendItem(cmdTrayOpenPlayer, "播放器")
+
 	procAppendMenuW.Call(hMenu, mfSeparator, 0, 0)
 	appendItem(cmdTrayShowConsole, "显示控制台")
 	appendItem(cmdTrayHideConsole, "隐藏控制台")
+	appendItem(cmdTrayCopyAddress, "复制访问地址")
 	procAppendMenuW.Call(hMenu, mfSeparator, 0, 0)
 	appendItem(cmdTrayAbout, "关于 ipscan")
 	appendItem(cmdTrayExit, "退出")
@@ -500,9 +514,10 @@ func (a *trayApp) showMenu() {
 // 以下是各菜单项对应的独立命令函数。
 
 // openWindow 用内嵌 miniblink 窗口打开地址；内核不可用时回退系统浏览器。
-func (a *trayApp) openWindow(url string) {
+// size 为零值表示主页的大窗口，其他窗口由调用方传入配置尺寸或 800x600。
+func (a *trayApp) openWindow(url string, size windowSize) {
 	if a.cfg.mbDLL != "" {
-		if err := openMbWindow(a.cfg.mbDLL, url, a.cfg.homeURL, true); err == nil {
+		if err := openMbWindow(a.cfg.mbDLL, url, a.cfg.homeURL, true, size); err == nil {
 			return
 		} else {
 			fmt.Println("  内嵌内核打开窗口失败：" + err.Error() + "，改用默认浏览器")
@@ -511,15 +526,46 @@ func (a *trayApp) openWindow(url string) {
 	_ = openBrowser(url)
 }
 
-func (a *trayApp) commandOpenHome() { a.openWindow(a.cfg.homeURL) }
+// openTool 按 tools.txt 配置的打开方式打开工具。
+func (a *trayApp) openTool(t toolEntry) {
+	switch t.Mode {
+	case toolModeSystem:
+		_ = openBrowser(t.URL)
+	case toolModeChrome:
+		_ = openExternalChrome(t.URL, t.Size)
+	default:
+		a.openWindow(t.URL, t.Size)
+	}
+}
 
-func (a *trayApp) commandOpenClipboard() { a.openWindow(a.cfg.clipboardURL) }
+func (a *trayApp) commandOpenHome() { a.openWindow(a.cfg.homeURL, windowSize{}) }
+
+func (a *trayApp) commandOpenClipboard() { a.openWindow(a.cfg.clipboardURL, defaultToolWindowSize) }
 
 // commandOpenAria2c 先确保 aria2c RPC 就绪，再打开 AriaNg 页面。
 func (a *trayApp) commandOpenAria2c() {
 	go func() {
 		ensureAria2cFromURL(a.cfg.aria2cURL)
-		a.openWindow(a.cfg.aria2cURL)
+		a.openWindow(a.cfg.aria2cURL, defaultToolWindowSize)
+	}()
+}
+
+// commandOpenPlayer 在新线程中用 libmpv 打开播放窗口，不打开页面与其它无关模块。
+func (a *trayApp) commandOpenPlayer() {
+	go func() {
+		demo := filepath.Join(mpvDataDir(), "demo.mp4")
+		if !isExistingFile(demo) {
+			return
+		}
+		dll, err := ensureMpvDLL(a.cfg.aria2cURL)
+		if err != nil {
+			fmt.Println("  libmpv-2.dll 准备失败：" + err.Error())
+			return
+		}
+		fmt.Println("  播放器启动：" + dll + ",文件	" + demo)
+		if err := startMpvPlayer(dll, demo); err != nil {
+			fmt.Println("  libmpv 播放器启动失败：" + err.Error())
+		}
 	}()
 }
 

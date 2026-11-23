@@ -1,3 +1,7 @@
-必应翻译,800x600,https://cn.bing.com/translator?setmkt=zh-cn&setlang=zh-cn
-百度汉语,800x600,https://dict.baidu.com/
-百度地图,800x600,https://map.baidu.com/
+# 格式：名称,窗口尺寸,地址,打开方式
+# 打开方式：内部 / 系统 / 外部chrome（也支持 internal / system / chrome），可省略，默认内部
+# 示例：在线工具,1000x700,https://example.com/,外部chrome
+必应翻译,800x600,https://cn.bing.com/translator?setmkt=zh-cn&setlang=zh-cn,内部
+百度汉语,800x600,https://dict.baidu.com/,内部
+百度地图,800x600,https://map.baidu.com/,内部
+漢典古籍,800x600,https://gj.zdic.net/,内部

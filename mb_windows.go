@@ -3,6 +3,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -20,6 +21,10 @@ import (
 const (
 	mbWindowTypePopup = 0
 	wmQuit            = 0x0012
+	wmClose           = 0x0010
+	wmDropFiles       = 0x0233
+	gwlpWndProc       = ^uintptr(3) // GWLP_WNDPROC = -4
+	dragQueryAllFiles = 0xFFFFFFFF
 	smCXScreen        = 0
 	smCYScreen        = 1
 	swHide            = 0
@@ -37,7 +42,13 @@ const (
 var (
 	modKernel32 = syscall.NewLazyDLL("kernel32.dll")
 	modUser32   = syscall.NewLazyDLL("user32.dll")
+	modShell32  = syscall.NewLazyDLL("shell32.dll")
 
+	procCallWindowProcW       = modUser32.NewProc("CallWindowProcW")
+	procSetWindowLongPtrW     = modUser32.NewProc("SetWindowLongPtrW")
+	procSetWindowLongW        = modUser32.NewProc("SetWindowLongW")
+	procDragAcceptFiles       = modShell32.NewProc("DragAcceptFiles")
+	procDragQueryFileW        = modShell32.NewProc("DragQueryFileW")
 	procSetDllDirectoryW      = modKernel32.NewProc("SetDllDirectoryW")
 	procGetConsoleWindow      = modKernel32.NewProc("GetConsoleWindow")
 	procGetConsoleProcessList = modKernel32.NewProc("GetConsoleProcessList")
@@ -299,6 +310,7 @@ const (
 	vkLeft     = 0x25
 	vkRight    = 0x27
 	vkR        = 0x42
+	vkF4       = 0x73
 	vkF5       = 0x74
 	keyDownBit = 0x8000
 )
@@ -521,6 +533,117 @@ func monitorMbKeys(hwnd uintptr, reg *mbShortcutRegistry) {
 	}
 }
 
+// 文件拖入监听：mb 内核自身会响应 WM_DROPFILES，这里挂接只读窗口过程输出文件路径，
+// 消息仍原样转交给原窗口过程，不改变页面加载行为。
+var (
+	mbDropMu    sync.Mutex
+	mbDropProcs = make(map[uintptr]uintptr) // HWND -> 原始窗口过程
+	mbDropOnce  sync.Once
+	mbDropCB    uintptr
+)
+
+func setWindowLongPtr(hwnd, index, value uintptr) uintptr {
+	if runtime.GOARCH == "386" {
+		r, _, _ := procSetWindowLongW.Call(hwnd, index, uintptr(uint32(value)))
+		return r
+	}
+	r, _, _ := procSetWindowLongPtrW.Call(hwnd, index, value)
+	return r
+}
+
+func mbDropCallback() uintptr {
+	mbDropOnce.Do(func() {
+		mbDropCB = mbNewCallback(func(hwnd, msg, wParam, lParam uintptr) uintptr {
+			if msg == wmDropFiles {
+				logMbDroppedFiles(hwnd, wParam)
+			}
+			mbDropMu.Lock()
+			orig := mbDropProcs[hwnd]
+			mbDropMu.Unlock()
+			if orig == 0 {
+				return 0
+			}
+			r, _, _ := procCallWindowProcW.Call(orig, hwnd, msg, wParam, lParam)
+			return r
+		})
+	})
+	return mbDropCB
+}
+
+// droppedFilePaths 读取 WM_DROPFILES 携带的全部文件路径。
+func droppedFilePaths(hDrop uintptr) []string {
+	if hDrop == 0 || procDragQueryFileW.Find() != nil {
+		return nil
+	}
+	n, _, _ := procDragQueryFileW.Call(hDrop, uintptr(dragQueryAllFiles), 0, 0)
+	if n == 0 || n == uintptr(dragQueryAllFiles) {
+		return nil
+	}
+	count := int(n)
+	paths := make([]string, 0, count)
+	for i := 0; i < count; i++ {
+		length, _, _ := procDragQueryFileW.Call(hDrop, uintptr(i), 0, 0)
+		size := int(length)
+		if size <= 0 || size > 32767 {
+			continue
+		}
+		buf := make([]uint16, size+1)
+		got, _, _ := procDragQueryFileW.Call(hDrop, uintptr(i), uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
+		if got == 0 {
+			continue
+		}
+		paths = append(paths, syscall.UTF16ToString(buf))
+	}
+	return paths
+}
+
+func logMbDroppedFiles(hwnd, hDrop uintptr) {
+	paths := droppedFilePaths(hDrop)
+	if len(paths) == 0 {
+		return
+	}
+	mbLogEvent("文件拖入", fmt.Sprintf("HWND=%d 文件数=%d：%s", hwnd, len(paths), strings.Join(paths, " | ")))
+}
+
+// installMbDropWatcher 必须在窗口所属线程调用：开启拖放接收并挂接只读监听。
+func installMbDropWatcher(hwnd uintptr) {
+	if hwnd == 0 {
+		return
+	}
+	if procDragAcceptFiles.Find() == nil {
+		procDragAcceptFiles.Call(hwnd, 1)
+	}
+	if runtime.GOARCH == "386" {
+		if procSetWindowLongW.Find() != nil {
+			return
+		}
+	} else if procSetWindowLongPtrW.Find() != nil {
+		return
+	}
+	orig := setWindowLongPtr(hwnd, gwlpWndProc, mbDropCallback())
+	if orig == 0 {
+		return
+	}
+	mbDropMu.Lock()
+	mbDropProcs[hwnd] = orig
+	mbDropMu.Unlock()
+	mbLogEvent("文件拖入", fmt.Sprintf("HWND=%d 监听已启用", hwnd))
+}
+
+// restoreMbDropHandler 在窗口关闭时还原原始窗口过程，避免 HWND 复用后继续收到回调。
+func restoreMbDropHandler(hwnd uintptr) {
+	mbDropMu.Lock()
+	orig := mbDropProcs[hwnd]
+	delete(mbDropProcs, hwnd)
+	mbDropMu.Unlock()
+	if orig == 0 {
+		return
+	}
+	if alive, _, _ := procIsWindow.Call(hwnd); alive != 0 {
+		setWindowLongPtr(hwnd, gwlpWndProc, orig)
+	}
+}
+
 // isLocalMbURL 判断地址是否指向本机主进程页面，这类页面保留网页自身标题
 func isLocalMbURL(u string) bool {
 	s := strings.ToLower(u)
@@ -605,6 +728,46 @@ func registerMbDownloads(optional func(string, ...uintptr) uintptr, view uintptr
 	optional("mbOnDownloadInBlinkThread", view, startCB, 0)
 }
 
+// playerFileLogPrefix 是 player.html 通过 console.log 传递文件信息的消息标记。
+const playerFileLogPrefix = "IPSCAN_PLAYER_FILE:"
+
+type playerFileInfo struct {
+	Name         string `json:"name"`
+	Type         string `json:"type"`
+	Size         int64  `json:"size"`
+	LastModified int64  `json:"lastModified"`
+}
+
+// handlePlayerFileConsole 解析播放器页面发来的文件信息并输出到主控制台。
+func handlePlayerFileConsole(raw string) {
+	var info playerFileInfo
+	if err := json.Unmarshal([]byte(raw), &info); err != nil {
+		mbLogEvent("播放器文件", "解析文件信息失败："+err.Error()+" 原始数据="+raw)
+		return
+	}
+	kind := "其他"
+	t := strings.ToLower(info.Type)
+	switch {
+	case strings.HasPrefix(t, "video/"):
+		kind = "视频"
+	case strings.HasPrefix(t, "audio/"):
+		kind = "音频"
+	default:
+		switch strings.ToLower(filepath.Ext(info.Name)) {
+		case ".mp4", ".mkv", ".avi", ".mov", ".ts", ".flv", ".wmv", ".webm", ".m2ts":
+			kind = "视频"
+		case ".mp3", ".wav", ".flac", ".aac", ".m4a", ".ogg", ".wma":
+			kind = "音频"
+		}
+	}
+	modified := ""
+	if info.LastModified > 0 {
+		modified = " 修改时间=" + time.UnixMilli(info.LastModified).Format("2006-01-02 15:04:05")
+	}
+	mbLogEvent("播放器文件", fmt.Sprintf("名称=%s 类型=%s 分类=%s 大小=%s%s",
+		info.Name, info.Type, kind, playerFileSize(info.Size), modified))
+}
+
 // registerMbEvents 注册浏览器事件回调；allowLinks=false 时拦截链接点击与表单提交。
 // 窗口标题显示当前页面 URL，但本机页面（localhost / 127.0.0.1）保留网页标题。
 func registerMbEvents(optional func(string, ...uintptr) uintptr, view uintptr, allowLinks bool, initialURL string, res *mbResourceSet) {
@@ -669,7 +832,12 @@ func registerMbEvents(optional func(string, ...uintptr) uintptr, view uintptr, a
 	optional("mbOnLoadUrlFail", view, failCB, 0)
 
 	consoleCB := res.callback(func(_ uintptr, _ unsafe.Pointer, level uintptr, msg, source unsafe.Pointer, line uintptr, _ unsafe.Pointer) uintptr {
-		mbLogEvent("页面控制台", fmt.Sprintf("级别=%d %s (行:%d)", level, mbUTF8String(msg), line))
+		text := mbUTF8String(msg)
+		if strings.HasPrefix(text, playerFileLogPrefix) {
+			handlePlayerFileConsole(strings.TrimPrefix(text, playerFileLogPrefix))
+			return 0
+		}
+		mbLogEvent("页面控制台", fmt.Sprintf("级别=%d %s (行:%d)", level, text, line))
 		return 0
 	})
 	optional("mbOnConsole", view, consoleCB, 0)
@@ -785,7 +953,54 @@ var (
 	mbCurrentSession *mbSession
 	mbAllClosedCh    = make(chan struct{})
 	mbAllClosedOnce  sync.Once
+
+	// extraWinMu/extraWindows 记录 libmpv 等非 miniblink 窗口，
+	// 与主进程窗口数一起决定何时退出。
+	extraWinMu   sync.Mutex
+	extraWindows = make(map[uintptr]bool)
 )
+
+func registerExtraWindow(hwnd uintptr) {
+	if hwnd == 0 {
+		return
+	}
+	extraWinMu.Lock()
+	extraWindows[hwnd] = true
+	n := len(extraWindows)
+	extraWinMu.Unlock()
+	mbLogEvent("窗口管理", fmt.Sprintf("登记播放器窗口 HWND=%d 额外窗口数=%d", hwnd, n))
+}
+
+func unregisterExtraWindow(hwnd uintptr) {
+	extraWinMu.Lock()
+	if !extraWindows[hwnd] {
+		extraWinMu.Unlock()
+		return
+	}
+	delete(extraWindows, hwnd)
+	n := len(extraWindows)
+	extraWinMu.Unlock()
+	mbLogEvent("窗口管理", fmt.Sprintf("移除播放器窗口 HWND=%d 额外窗口数=%d", hwnd, n))
+	if n == 0 {
+		notifyWindowCountChanged()
+	}
+}
+
+func extraWindowCount() int {
+	extraWinMu.Lock()
+	defer extraWinMu.Unlock()
+	return len(extraWindows)
+}
+
+// notifyWindowCountChanged 在非内嵌窗口关闭后重新检查是否该退出。
+func notifyWindowCountChanged() {
+	mbSessionMu.Lock()
+	s := mbCurrentSession
+	mbSessionMu.Unlock()
+	if s != nil {
+		s.scheduleQuit()
+	}
+}
 
 // mbSession 管理同一个 miniblink UI 线程上的所有窗口。
 // miniblink 要求 mbInit、窗口创建、mbLoadURL、mbRunMessageLoop 等调用固定在同一线程，
@@ -862,57 +1077,67 @@ func (s *mbSession) reset() {
 	mbSessionMu.Unlock()
 }
 
-// startMbWindow 初始化会话并创建首个窗口；会话已存在时不重复创建，直接返回。
-// 初始化在独立 UI goroutine 中完成，这里等待结果以便调用方决定回退默认浏览器。
-func startMbWindow(dllPath, url, homeURL string, allowLinks bool) error {
+// mbWindowSizeForURL 保证非主页窗口不会因零值尺寸而误用主页的大窗口。
+func mbWindowSizeForURL(url, homeURL string, size windowSize) windowSize {
+	if url != homeURL && (size.width <= 0 || size.height <= 0) {
+		return defaultToolWindowSize
+	}
+	return size
+}
+
+// ensureMbWindow 保证内核会话可用，并打开指定地址与尺寸的窗口。
+// 会话的查找与创建放在同一把锁内，避免并发调用重复初始化或丢失打开请求。
+func ensureMbWindow(dllPath, url, homeURL string, allowLinks bool, size windowSize) error {
+	for {
+		mbSessionMu.Lock()
+		if s := mbCurrentSession; s != nil {
+			mbSessionMu.Unlock()
+			<-s.initDone
+			if s.initErr == nil {
+				return s.open(url, allowLinks, size)
+			}
+			// 会话初始化失败：清理后重新判断，可能已有其他调用方重建了会话。
+			s.reset()
+			continue
+		}
+		s := &mbSession{
+			dllPath:   dllPath,
+			homeURL:   homeURL,
+			procs:     make(map[string]*syscall.LazyProc),
+			views:     make(map[uintptr]bool),
+			resources: make(map[uintptr]*mbResourceSet),
+			shortcuts: make(map[uintptr]*mbShortcutRegistry),
+			initDone:  make(chan struct{}),
+		}
+		s.optional = s.optionalCall
+		mbCurrentSession = s
+		mbSessionMu.Unlock()
+
+		go s.run(url, allowLinks, size)
+		<-s.initDone
+		if s.initErr != nil {
+			err := s.initErr
+			s.reset()
+			return err
+		}
+		return nil
+	}
+}
+
+// startMbWindow 初始化会话并创建启动窗口；初始化失败时返回错误供调用方回退默认浏览器。
+func startMbWindow(dllPath, url, homeURL string, allowLinks bool, size windowSize) error {
 	if dllPath == "" {
 		return fmt.Errorf("未找到可用的 mb132_x64.dll")
 	}
-	mbSessionMu.Lock()
-	if s := mbCurrentSession; s != nil {
-		mbSessionMu.Unlock()
-		<-s.initDone
-		return s.initErr
-	}
-	s := &mbSession{
-		dllPath:   dllPath,
-		homeURL:   homeURL,
-		procs:     make(map[string]*syscall.LazyProc),
-		views:     make(map[uintptr]bool),
-		resources: make(map[uintptr]*mbResourceSet),
-		shortcuts: make(map[uintptr]*mbShortcutRegistry),
-		initDone:  make(chan struct{}),
-	}
-	s.optional = s.optionalCall
-	mbCurrentSession = s
-	mbSessionMu.Unlock()
-
-	go s.run(url, allowLinks)
-	<-s.initDone
-	if s.initErr != nil {
-		s.reset()
-	}
-	return s.initErr
+	return ensureMbWindow(dllPath, url, homeURL, allowLinks, mbWindowSizeForURL(url, homeURL, size))
 }
 
 // openMbWindow 供托盘命令调用：会话不存在则启动，存在则向 UI 线程投递新窗口任务。
-func openMbWindow(dllPath, url, homeURL string, allowLinks bool) error {
+func openMbWindow(dllPath, url, homeURL string, allowLinks bool, size windowSize) error {
 	if dllPath == "" {
 		return fmt.Errorf("未找到可用的 mb132_x64.dll")
 	}
-	mbSessionMu.Lock()
-	s := mbCurrentSession
-	mbSessionMu.Unlock()
-
-	if s == nil {
-		return startMbWindow(dllPath, url, homeURL, allowLinks)
-	}
-	<-s.initDone
-	if s.initErr != nil {
-		s.reset()
-		return startMbWindow(dllPath, url, homeURL, allowLinks)
-	}
-	return s.open(url, allowLinks)
+	return ensureMbWindow(dllPath, url, homeURL, allowLinks, mbWindowSizeForURL(url, homeURL, size))
 }
 
 // post 把闭包投递到 miniblink UI 线程执行。
@@ -949,7 +1174,7 @@ func (s *mbSession) postToUI(cb, view uintptr, name string) {
 }
 
 // open 在当前 UI 线程上再开一个窗口。
-func (s *mbSession) open(url string, allowLinks bool) error {
+func (s *mbSession) open(url string, allowLinks bool, size windowSize) error {
 	s.viewsMu.Lock()
 	started := s.started
 	if started {
@@ -965,7 +1190,7 @@ func (s *mbSession) open(url string, allowLinks bool) error {
 	}
 
 	errCh := make(chan error, 1)
-	if err := s.post(func() { errCh <- s.createWindow(url, allowLinks) }); err != nil {
+	if err := s.post(func() { errCh <- s.createWindow(url, allowLinks, size) }); err != nil {
 		return err
 	}
 	select {
@@ -977,7 +1202,7 @@ func (s *mbSession) open(url string, allowLinks bool) error {
 }
 
 // run 锁定单个 OS 线程完成 mbInit、创建首个窗口并驱动消息循环。
-func (s *mbSession) run(initialURL string, allowLinks bool) {
+func (s *mbSession) run(initialURL string, allowLinks bool, size windowSize) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	defer s.reset()
@@ -1040,7 +1265,7 @@ func (s *mbSession) run(initialURL string, allowLinks bool) {
 	})
 
 	s.setStarted(true)
-	if err := s.createWindow(initialURL, allowLinks); err != nil {
+	if err := s.createWindow(initialURL, allowLinks, size); err != nil {
 		s.setStarted(false)
 		s.finishInit(err)
 		return
@@ -1052,13 +1277,17 @@ func (s *mbSession) run(initialURL string, allowLinks bool) {
 }
 
 // createWindow 必须在 UI 线程调用；每个窗口使用独立的快捷键注册表。
-func (s *mbSession) createWindow(url string, allowLinks bool) error {
-	w, h := 1200, 800
-	if v, _, _ := procGetSystemMetrics.Call(smCXScreen); v > 0 && int(v)*4/5 >= 960 {
-		w = int(v) * 4 / 5
-	}
-	if v, _, _ := procGetSystemMetrics.Call(smCYScreen); v > 0 && int(v)*4/5 >= 640 {
-		h = int(v) * 4 / 5
+// size 宽高有效时按其创建窗口，零值表示沿用主页默认的大窗口尺寸。
+func (s *mbSession) createWindow(url string, allowLinks bool, size windowSize) error {
+	w, h := size.width, size.height
+	if w <= 0 || h <= 0 {
+		w, h = 1200, 800
+		if v, _, _ := procGetSystemMetrics.Call(smCXScreen); v > 0 && int(v)*4/5 >= 960 {
+			w = int(v) * 4 / 5
+		}
+		if v, _, _ := procGetSystemMetrics.Call(smCYScreen); v > 0 && int(v)*4/5 >= 640 {
+			h = int(v) * 4 / 5
+		}
 	}
 
 	view, _, _ := s.proc("mbCreateWebWindow").Call(
@@ -1080,6 +1309,7 @@ func (s *mbSession) createWindow(url string, allowLinks bool) error {
 	s.viewsMu.Unlock()
 
 	s.optionalCall("mbMoveToCenter", view)
+	hostHWND := s.optionalCall("mbGetHostHWND", view)
 	if p := res.utf16Arg(url); p != 0 {
 		s.optionalCall("mbSetWindowTitleW", view, p)
 	}
@@ -1119,6 +1349,11 @@ func (s *mbSession) createWindow(url string, allowLinks bool) error {
 	shortcuts.add(mbModAlt, vkRight, func() { s.postToUI(goForwardCB, view, "Alt+Right") }, "前进")
 	shortcuts.add(0, vkF5, func() { s.postToUI(goReloadCB, view, "F5") }, "刷新当前页面")
 	shortcuts.add(mbModCtrl, vkR, func() { s.postToUI(goReloadCB, view, "Ctrl+R") }, "刷新当前页面")
+	shortcuts.add(mbModAlt, vkF4, func() {
+		if hostHWND != 0 {
+			procPostMessageW.Call(hostHWND, wmClose, 0, 0)
+		}
+	}, "关闭当前窗口")
 
 	registerMbEvents(s.optional, view, allowLinks, url, res)
 	registerMbLinkCopy(s.proc, view, res)
@@ -1132,10 +1367,14 @@ func (s *mbSession) createWindow(url string, allowLinks bool) error {
 	runtime.KeepAlive(urlBytes)
 	s.proc("mbShowWindow").Call(view, 1)
 
-	if hwnd := s.optionalCall("mbGetHostHWND", view); hwnd != 0 {
-		mbLogEvent("按键监听", fmt.Sprintf("窗口句柄=%d，快捷键 Ctrl+Home / Alt+Left / Alt+Right / F5 已启用", hwnd))
-		go monitorMbKeys(hwnd, shortcuts)
-		go s.watchWindow(view, hwnd, shortcuts)
+	if hostHWND == 0 {
+		hostHWND = s.optionalCall("mbGetHostHWND", view)
+	}
+	if hostHWND != 0 {
+		installMbDropWatcher(hostHWND)
+		mbLogEvent("按键监听", fmt.Sprintf("窗口句柄=%d，快捷键 Ctrl+Home / Alt+Left / Alt+Right / F5 / Ctrl+R / Alt+F4 已启用", hostHWND))
+		go monitorMbKeys(hostHWND, shortcuts)
+		go s.watchWindow(view, hostHWND, shortcuts)
 	}
 	return nil
 }
@@ -1161,6 +1400,7 @@ func (s *mbSession) windowGone(view uintptr) {
 
 	mbLogEvent("窗口关闭", fmt.Sprintf("句柄=%d 剩余窗口数=%d", view, n))
 	if n == 0 {
+		// 托盘存在时 scheduleQuit 只记录、不退出，菜单功能继续可用。
 		s.scheduleQuit()
 	}
 }
@@ -1191,10 +1431,15 @@ func (s *mbSession) scheduleQuit() {
 	}
 	s.quitTimer = time.AfterFunc(mbQuitGrace, func() {
 		s.viewsMu.Lock()
-		empty := len(s.views) == 0 && s.started
+		empty := len(s.views) == 0 && extraWindowCount() == 0 && s.started
 		threadID := s.uiThreadID
 		s.viewsMu.Unlock()
 		if !empty {
+			return
+		}
+		// 托盘存在时保留后台服务与菜单，窗口全关不退出；无托盘才自动结束进程。
+		if trayActive() {
+			mbLogEvent("窗口管理", "窗口已全部关闭，保留托盘与菜单")
 			return
 		}
 		notifyMbAllClosed()
@@ -1215,10 +1460,12 @@ func (s *mbSession) watchWindow(view, hwnd uintptr, shortcuts *mbShortcutRegistr
 		s.viewsMu.Unlock()
 		if !started || !exists {
 			shortcuts.stop()
+			restoreMbDropHandler(hwnd)
 			return
 		}
 		if alive, _, _ := procIsWindow.Call(hwnd); alive == 0 {
 			shortcuts.stop()
+			restoreMbDropHandler(hwnd)
 			s.windowGone(view)
 			s.releaseViewResources(view)
 			return

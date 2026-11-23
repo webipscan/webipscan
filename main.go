@@ -10,10 +10,12 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"mime"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -188,9 +190,50 @@ type launchOptions struct {
 	targetURL string // --url：存在 mb132_x64.dll 时用 miniblink 打开该地址
 }
 
-// parseLaunchArgs 解析启动参数，保留旧用法（第一个位置参数为端口）
+// isPortNumber 判断字符串是否为合法端口数字（1-65535）。
+// 端口是否已被占用由后续 listenPort 顺延处理，这里只做格式与范围校验。
+func isPortNumber(s string) bool {
+	if s == "" {
+		return false
+	}
+	n, err := strconv.Atoi(s)
+	return err == nil && n >= 1 && n <= 65535
+}
+
+// isExistingFile 判断参数是否为已存在的普通文件。
+func isExistingFile(s string) bool {
+	info, err := os.Stat(s)
+	return err == nil && !info.IsDir()
+}
+
+// detectFileType 综合扩展名与文件头部内容给出可读的文件类型描述。
+func detectFileType(path string) string {
+	ext := strings.ToLower(filepath.Ext(path))
+	parts := make([]string, 0, 3)
+	if ext != "" {
+		parts = append(parts, "扩展名 "+ext)
+		if mt := mime.TypeByExtension(ext); mt != "" {
+			parts = append(parts, "MIME "+mt)
+		}
+	}
+	if f, err := os.Open(path); err == nil {
+		buf := make([]byte, 512)
+		if n, _ := f.Read(buf); n > 0 {
+			parts = append(parts, "内容检测 "+http.DetectContentType(buf[:n]))
+		}
+		_ = f.Close()
+	}
+	if len(parts) == 0 {
+		return "未知类型"
+	}
+	return strings.Join(parts, "，")
+}
+
+// parseLaunchArgs 解析启动参数：位置参数依次识别为端口、文件、URL。
 func parseLaunchArgs(args []string) (launchOptions, error) {
 	o := launchOptions{port: defaultPort}
+	portSet := false
+	positionalSeen := false
 	next := func(i *int, name string) (string, error) {
 		if *i+1 >= len(args) {
 			return "", fmt.Errorf("%s 缺少参数值", name)
@@ -217,9 +260,18 @@ func parseLaunchArgs(args []string) (launchOptions, error) {
 			if err != nil {
 				return o, err
 			}
+			if !isPortNumber(v) {
+				return o, fmt.Errorf("端口无效：%s", v)
+			}
 			o.port = v
+			portSet = true
 		case strings.HasPrefix(a, "-p=") || strings.HasPrefix(a, "--port="):
-			o.port = strings.Trim(strings.TrimSpace(strings.SplitN(a, "=", 2)[1]), "\"'")
+			v := strings.Trim(strings.TrimSpace(strings.SplitN(a, "=", 2)[1]), "\"'")
+			if !isPortNumber(v) {
+				return o, fmt.Errorf("端口无效：%s", v)
+			}
+			o.port = v
+			portSet = true
 		case a == "--url":
 			v, err := next(&i, "--url")
 			if err != nil {
@@ -231,10 +283,23 @@ func parseLaunchArgs(args []string) (launchOptions, error) {
 		case strings.HasPrefix(a, "-"):
 			return o, fmt.Errorf("未知参数：%s", a)
 		default:
-			if o.port == defaultPort {
-				o.port = a // 兼容旧用法：webipscan.exe 9200
-			} else {
+			if positionalSeen {
 				return o, fmt.Errorf("多余的参数：%s", a)
+			}
+			positionalSeen = true
+			switch {
+			case !portSet && isPortNumber(a):
+				o.port = a // 兼容旧用法：webipscan.exe 9200
+			case isExistingFile(a):
+				fmt.Printf("  位置参数识别为文件：%s\n", a)
+				fmt.Printf("  文件类型：%s\n", detectFileType(a))
+			case isHTTPURL(a):
+				// 位置参数为 URL 时与 --url 等价，交由内置 mb 浏览器打开。
+				if o.targetURL == "" {
+					o.targetURL = a
+				}
+			default:
+				return o, fmt.Errorf("无法识别的位置参数：%s", a)
 			}
 		}
 	}
@@ -245,7 +310,7 @@ func main() {
 	opts, err := parseLaunchArgs(os.Args[1:])
 	if err != nil {
 		fmt.Println("启动参数错误：" + err.Error())
-		fmt.Println("用法：webipscan.exe [-p 端口] [--daemon|-d|--noopen|-n] [--url 地址] [--no-links] [--no-tray] [--user|--user-mode] [--no-user|--no-user-mode]")
+		fmt.Println("用法：webipscan.exe [-p 端口] [端口|文件|URL] [--daemon|-d|--noopen|-n] [--url 地址] [--no-links] [--no-tray] [--user|--user-mode] [--no-user|--no-user-mode]")
 		exitMain(1)
 		return
 	}
@@ -340,7 +405,7 @@ func main() {
 	case !showUI:
 		fmt.Println("  无窗口模式：不隐藏控制台、不打开浏览器（按 Ctrl+C 停止）")
 	case mbPath != "":
-		fmt.Println("  页面显示：miniblink 窗口（控制台已隐藏），关闭所有窗口即退出程序")
+		fmt.Println("  页面显示：miniblink 窗口（控制台已隐藏），托盘常驻；无托盘时关闭所有窗口即退出")
 	default:
 		fmt.Println("  浏览器已自动打开，按 Ctrl+C 停止")
 	}
@@ -376,7 +441,11 @@ func main() {
 	time.Sleep(400 * time.Millisecond)
 	mbStarted := false
 	if mbPath != "" && (showUI || opts.targetURL != "") {
-		if err := startMbWindow(mbPath, openURL, url, !opts.noLinks); err != nil {
+		initialSize := windowSize{}
+		if openURL != url {
+			initialSize = defaultToolWindowSize
+		}
+		if err := startMbWindow(mbPath, openURL, url, !opts.noLinks, initialSize); err != nil {
 			// 初始化/创建窗口失败：恢复控制台让错误信息可见
 			setConsoleVisible(true)
 			fmt.Println("  miniblink 窗口启动失败：" + err.Error())
@@ -399,7 +468,7 @@ func main() {
 	// 托盘命令打开的内嵌窗口与启动窗口共享会话；最后一个窗口关闭时退出。
 	select {
 	case <-mbAllClosed():
-		fmt.Println("  所有 miniblink 窗口已关闭，程序退出")
+		fmt.Println("  所有窗口（含播放器）已关闭，程序退出")
 		exitMain(0)
 	case err := <-serveErr:
 		if err != nil {

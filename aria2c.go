@@ -18,6 +18,7 @@ const (
 	aria2cRPCPort = "6800"
 	aria2cArchive = "aria2c.7z"
 	aria2c7zrPath = "static/7zr.exe"
+	aria2cConfRel = ".aria2c/aria2c.conf"
 )
 
 var (
@@ -228,6 +229,37 @@ func extractAria2cExe(archive, dest string) error {
 	return os.Rename(extracted, dest)
 }
 
+// aria2cDefaultConf 返回 aria2c 默认配置内容，选项与启动参数保持一致。
+func aria2cDefaultConf() string {
+	return fmt.Sprintf(`# aria2c 配置文件，不存在时由程序自动生成，可按需修改
+enable-rpc=true
+rpc-allow-origin-all=true
+continue=true
+rpc-listen-port=%s
+force-save=true
+dir=.aria2c/
+save-session-interval=3
+max-connection-per-server=16
+split=64
+min-split-size=4M
+save-session=.aria2c/.session
+input-file=.aria2c/.session
+`, aria2cRPCPort)
+}
+
+// ensureAria2cConf 确保配置文件存在，不存在时写入默认配置。
+func ensureAria2cConf(dataDir string) {
+	confPath := filepath.Join(dataDir, "aria2c.conf")
+	if _, err := os.Stat(confPath); err == nil {
+		return
+	}
+	if err := os.WriteFile(confPath, []byte(aria2cDefaultConf()), 0644); err != nil {
+		aria2cLog("创建 %s 失败：%v", confPath, err)
+		return
+	}
+	aria2cLog("已创建默认配置文件 %s", confPath)
+}
+
 // ensureAria2cFromURL 在加载本机 AriaNg 页面时检查 aria2c 与 6800 端口，
 // 均未占用时更新 aria2c.exe、准备目录并以后台子进程方式启动 RPC。
 func ensureAria2cFromURL(pageURL string) {
@@ -282,12 +314,14 @@ func ensureAria2cFromURL(pageURL string) {
 			aria2cLog("已创建空的 session 文件 %s", sessionPath)
 		}
 	}
+	ensureAria2cConf(dataDir)
 
 	abs, err := filepath.Abs(local)
 	if err != nil {
 		abs = local
 	}
 	cmd := exec.Command(abs,
+		"--conf-path="+aria2cConfRel,
 		"--enable-rpc=true",
 		"--rpc-allow-origin-all=true",
 		"--continue=true",
@@ -295,6 +329,9 @@ func ensureAria2cFromURL(pageURL string) {
 		"--force-save=true",
 		"--dir=.aria2c/",
 		"--save-session-interval=3",
+		"--max-connection-per-server=16", //# 单服务器最大连接数
+		"--split=64",                     // # 单任务最大分段数
+		"--min-split-size=4M",            // # 最小分段大小
 		"--save-session=.aria2c/.session",
 		"--input-file=.aria2c/.session",
 	)

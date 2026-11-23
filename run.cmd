@@ -20,4 +20,6 @@ REM go-winres make
 @REM go build -ldflags="-s -w"  && dir && webipscan.exe -d --url http://127.0.0.1:9100
 @REM go build -ldflags="-s -w"  && dir && webipscan.exe -d --url http://127.0.0.1:9100
 REM go build -ldflags="-s -w"  && dir && webipscan --user -d --url http://127.0.0.1:9801
-go build -ldflags="-s -w"  && dir && webipscan --user -d 
+REM go build -ldflags="-s -w"  && dir && webipscan --user -d 
+go build -ldflags="-s -w"  && dir && webipscan --user -d  demo.mp4
+

@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ipscan 播放器</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; overflow: hidden; }
+  body {
+    margin: 0; background: #10131a; color: #e8ecf3;
+    font: 12px/1.4 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    display: flex; flex-direction: column;
+  }
+  header {
+    flex: 0 0 24px; display: flex; align-items: center; gap: 8px;
+    padding: 0 8px; border-bottom: 1px solid #232a36;
+  }
+  header b { font-size: 12px; font-weight: 600; }
+  header span { color: #7d8799; font-size: 11px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+  main {
+    flex: 1 1 auto; min-height: 0; padding: 6px 8px;
+    display: flex; flex-direction: column; gap: 5px;
+  }
+  .stage {
+    flex: 1 1 auto; min-height: 0; background: #000;
+    border: 1px solid #262d3a; border-radius: 5px; overflow: hidden;
+    display: grid; place-items: center;
+  }
+  .stage.over { border-color: #4d9fff; background: #121a28; }
+  video { width: 100%; height: 100%; object-fit: contain; display: block; background: #000; }
+  .hint { color: #6f7889; font-size: 11px; text-align: center; }
+  .bar { flex: 0 0 26px; display: flex; align-items: center; gap: 6px; }
+  .bar span { flex: 1 1 auto; color: #7d8799; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+  button {
+    flex: 0 0 auto; border: 0; border-radius: 5px; padding: 3px 10px;
+    background: #2f6fe4; color: #fff; cursor: pointer; font-size: 11px;
+  }
+  button:hover { background: #3d7ef0; }
+  input[type=file] { display: none; }
+  .info {
+    flex: 0 0 15px; color: #8b95a6; font-size: 11px;
+    overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+  }
+  .info b { color: #cbd5e3; font-weight: 500; }
+</style>
+</head>
+<body>
+<header><b>ipscan 播放器</b><span>拖入或选择本地音视频文件</span></header>
+<main>
+  <div class="stage" id="stage">
+    <video id="player" controls playsinline hidden></video>
+    <div class="hint" id="hint">尚未载入媒体文件</div>
+  </div>
+  <div class="bar">
+    <span>空格 播放/暂停 · F 全屏</span>
+    <button id="pick" type="button">选择文件</button>
+    <input id="file" type="file" accept="video/*,audio/*,.mkv,.avi,.ts,.flv,.wmv,.m2ts">
+  </div>
+  <div class="info" id="info"></div>
+</main>
+<script>
+(function () {
+  var player = document.getElementById('player');
+  var hint = document.getElementById('hint');
+  var info = document.getElementById('info');
+  var stage = document.getElementById('stage');
+  var fileInput = document.getElementById('file');
+  var objectURL = '';
+
+  function sizeText(n) {
+    if (!n && n !== 0) return '';
+    var u = ['B', 'KB', 'MB', 'GB'], i = 0;
+    while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+    return n.toFixed(i ? 1 : 0) + ' ' + u[i];
+  }
+
+  function escapeHTML(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+
+  function load(file) {
+    if (!file) return;
+    console.log('IPSCAN_PLAYER_FILE:' + JSON.stringify({
+      name: file.name,
+      type: file.type || '',
+      size: file.size,
+      lastModified: file.lastModified
+    }));
+    if (objectURL) URL.revokeObjectURL(objectURL);
+    objectURL = URL.createObjectURL(file);
+    player.src = objectURL;
+    player.hidden = false;
+    hint.hidden = true;
+    info.innerHTML = '<b>' + escapeHTML(file.name) + '</b> · ' +
+      escapeHTML(file.type || '未知类型') + ' · ' + sizeText(file.size);
+    player.play().catch(function () {});
+  }
+
+  document.getElementById('pick').addEventListener('click', function () { fileInput.click(); });
+  fileInput.addEventListener('change', function () { load(fileInput.files[0]); });
+
+  ['dragenter', 'dragover'].forEach(function (e) {
+    document.addEventListener(e, function (ev) { ev.preventDefault(); stage.classList.add('over'); });
+  });
+  ['dragleave', 'drop'].forEach(function (e) {
+    document.addEventListener(e, function (ev) { ev.preventDefault(); stage.classList.remove('over'); });
+  });
+  document.addEventListener('drop', function (ev) {
+    ev.preventDefault();
+    if (ev.dataTransfer && ev.dataTransfer.files.length) load(ev.dataTransfer.files[0]);
+  });
+
+  document.addEventListener('keydown', function (ev) {
+    if (ev.target && ev.target.tagName === 'INPUT') return;
+    if (ev.code === 'Space') { ev.preventDefault(); if (player.paused) player.play(); else player.pause(); }
+    if (ev.key === 'f' || ev.key === 'F') {
+      if (document.fullscreenElement) document.exitFullscreen();
+      else player.requestFullscreen && player.requestFullscreen();
+    }
+  });
+  window.addEventListener('beforeunload', function () { if (objectURL) URL.revokeObjectURL(objectURL); });
+})();
+</script>
+</body>
+</html>

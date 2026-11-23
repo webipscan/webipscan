@@ -12,6 +12,8 @@ go build -ldflags="-s -w" -o ipscan.exe .
 ./ipscan.exe          # 默认 9100
 ./ipscan.exe 9000     # 指定端口（旧用法，仍兼容）
 ./ipscan.exe -p 9000  # 指定端口
+./ipscan.exe report.pdf   # 位置参数为文件：输出检测到的文件类型
+./ipscan.exe https://example.com   # 位置参数为 URL：有 mb132_x64.dll 时用内置 mb 窗口打开
 ./ipscan.exe -d       # 守护/无窗口模式：不隐藏控制台、不打开浏览器
 ./ipscan.exe --url https://example.com   # 有 mb132_x64.dll 时用 miniblink 打开该地址
 ```
@@ -20,7 +22,8 @@ go build -ldflags="-s -w" -o ipscan.exe .
 
 | 参数 | 说明 |
 |---|---|
-| `-p <端口>` / `--port <端口>` / 位置参数 | 指定监听端口，被占用时仍自动向上顺延 |
+| `-p <端口>` / `--port <端口>` | 指定监听端口（1-65535），被占用时仍自动向上顺延 |
+| 位置参数 | 按 `合法端口数字 → 已存在文件 → http/https URL` 顺序识别：端口用作监听端口；文件仅在控制台输出检测到的类型（扩展名/MIME/内容检测）；URL 等价于 `--url`，有可用 `mb132_x64.dll` 时用内置 mb 浏览器窗口打开 |
 | `--daemon` / `-d` / `--noopen` / `-n` | 不隐藏控制台窗口，也不打开浏览器或 miniblink 窗口；服务保持运行，按 `Ctrl+C` 停止 |
 | `--url <地址>` / `--url=<地址>` | 仅在存在可用 `mb132_x64.dll` 时生效：用内嵌内核窗口打开该地址（可与 `-d` 同用，此时控制台仍保留） |
 | `--no-links` | 禁止 miniblink 窗口内点击链接/提交表单跳转；默认允许，并且链接会在当前窗口跳转 |
@@ -36,13 +39,17 @@ go build -ldflags="-s -w" -o ipscan.exe .
 
 - 打开主页 / 打开网络剪贴板（有可用内核时用内嵌窗口，否则回退系统浏览器；可同时打开多个窗口）
 - 打开 aria2c 页面（AriaNg，打开前确保 aria2c RPC 就绪）
-- 工具（优先从 `tools.txt` 读取并与内置列表去重合并，内置含必应翻译、百度汉语、百度地图、Golang 库；总菜单项少于 32 个时平铺，否则放入“工具”子菜单）
+- 播放器（在当前进程新线程中用 libmpv 打开播放窗口，不打开页面与其它无关模块；用户目录 `webipscan` 下存在 `demo.mp4` 时循环播放，拖入文件由 libmpv 原生 `drag-and-drop` 处理并切换播放内容。播放器窗口 HWND 计入窗口总数，关闭时注销。DLL 缺失时通过当前 AriaNg 页面对应的 aria2c JSON-RPC 提交 `aria2.addUri` 任务，从 `links.txt` 中记录的官方地址或镜像下载 7z 包并解压出该 DLL）
+- 窗口与退出：启用托盘时，即使所有窗口关闭也保留托盘与菜单，通过“退出”或 Ctrl+C 结束；未启用托盘（`--no-tray`）时，所有窗口关闭即自动退出进程。mpv 播放窗口关闭后与其它窗口一起参与窗口计数判断。
+- 工具（优先从 `tools.txt` 读取并与内置列表去重合并；每行格式为 `名称,窗口尺寸,地址,打开方式`，尺寸如 `800x600`，打开方式可选 `内部` / `系统` / `外部chrome`（也支持 `internal` / `system` / `chrome`，可省略，默认内部）。总菜单项少于 32 个时平铺，否则放入“工具”子菜单）
 - 复制访问地址（写入系统剪贴板）
 - 显示控制台 / 隐藏控制台
 - 关于 ipscan（版本、地址、exe 路径）
 - 退出（走统一清理流程后结束进程）
 
 双击托盘图标可直接打开主页。
+
+主页窗口保持原有按屏幕自适应的大窗口；其他新开的内嵌窗口（剪贴板、aria2c、播放器、工具、`--url` 指定的非主页地址）默认尺寸为 **800x600**。工具可在 `tools.txt` 中单独指定尺寸：内嵌窗口按该尺寸创建，外部 Chrome 通过 `--window-size` 指定，系统默认浏览器无法控制尺寸。`内部` 方式在 `mb132_x64.dll` 不可用时自动回退系统浏览器，`外部chrome` 找不到 Chrome 时同样回退。
 
 页面快捷键：`Ctrl + G` 弹出网址输入框，回车后在页内 iframe 打开该地址（省略协议时默认 `http://`，
 仅允许 http/https）；`Ctrl + Home` 退出页内浏览并回到本地服务默认页面。若目标站点设置了
@@ -57,7 +64,9 @@ miniblink 窗口运行期间，**标题变化、地址变化、加载完成/失�
 `mbOnDownloadInBlinkThread` / `mbPopupDialogAndDownload`，否则会在控制台提示该功能不可用。
 默认允许点击链接并在当前窗口跳转；如需禁用可用 `--no-links`。
 加载本机 `AriaNg.html` 时，程序会检查系统是否已有 `aria2c` 进程以及 6800 端口是否被占用；两者都空闲时才从当前服务的 `/aria2c.7z` 解压更新运行时目录下的 `aria2c.exe`（用户模式下为 `%USERPROFILE%\<exe 文件名>`），在该目录下创建 `.aria2c` 会话目录，并以运行时目录为工作目录后台启动 RPC（`--enable-rpc` / `--rpc-listen-port=6800` / `--dir=.aria2c/` / `--save-session=.aria2c/.session` 等），子进程控制台输出写入 `.aria2c/aria2c.log`。已有进程或端口被占用时只输出提示，不会重复启动。
-mb 窗口标题显示当前页面 URL（本机页面保留网页标题）；按 `Ctrl + Home` 可返回主进程端口页面（`http://127.0.0.1:<端口>`），`Alt + Left` / `Alt + Right` 分别为后退 / 前进，`F5` / `Ctrl + R` 为刷新。这些快捷键在 `mb_windows.go` 的 `mbShortcutRegistry` 中集中注册：继续调用 `add` 即可添加更多组合，`add` 返回的取消函数可撤销单条，`stop()` 可停止整个按键监听。
+mb 窗口标题显示当前页面 URL（本机页面保留网页标题）；按 `Ctrl + Home` 可返回主进程端口页面（`http://127.0.0.1:<端口>`），`Alt + Left` / `Alt + Right` 分别为后退 / 前进，`F5` / `Ctrl + R` 为刷新，`Alt + F4` 关闭当前窗口。这些快捷键在 `mb_windows.go` 的 `mbShortcutRegistry` 中集中注册：继续调用 `add` 即可添加更多组合，`add` 返回的取消函数可撤销单条，`stop()` 可停止整个按键监听。
+
+把文件从资源管理器拖入 mb 窗口时，控制台会以 `[mb 时间] 文件拖入: ...` 输出窗口句柄、文件数量和完整路径；该监听只读取 `WM_DROPFILES`，消息仍交给内核原有处理逻辑，不会改变拖放行为。
 
 **端口被占用时自动顺延**：默认端口为 **9100**。若指定端口（或默认 9100）已被占用，程序会**逐端口向上检测**（9101、9102…最多再试 99 次），找到第一个可用端口后启动，并在控制台打印占用者与最终使用的端口：
 
@@ -232,12 +241,14 @@ ipscan/
 ├── publicip.go        公网连接状态判断、出口 IP 获取与属地信息整合（带 5 分钟缓存）
 ├── clipboard.go       网络剪贴板信令：SDP 链接信息暂存/过期/删除，不保存任何内容
 ├── qrcode.go          纯标准库二维码编码（Byte 模式 / 纠错 L / 版本 1-6）与 SVG 输出
-├── browser.go         调用系统默认浏览器 + 检测当前目录是否含 mb132_x64.dll（Windows 用 rundll32，不闪黑框）
+├── browser.go         调用系统默认浏览器与外部 Chrome（--window-size），Windows 用 rundll32 不闪黑框
+├── mpv.go             校验 libmpv-2.dll，缺失时用 aria2c JSON-RPC 下载并用 7zr 解压
+├── mpv_player_windows.go 以线程模式运行 libmpv-2.dll 播放器（Windows，循环播放 + 原生拖放）
 ├── mb_windows.go      动态加载 mb132_x64.dll，管理共享 UI 线程上的多个 miniblink 窗口（Windows）
 ├── mb_other.go        非 Windows 平台占位
 ├── tray.go            托盘命令所需的运行时配置
-├── tools_config.go    读取 tools.txt 中的工具地址
-├── tools.txt          工具菜单配置（名称,尺寸,地址）
+├── tools_config.go    读取 tools.txt 中的工具地址、窗口尺寸与打开方式
+├── tools.txt          工具菜单配置（名称,尺寸,地址,打开方式）
 ├── tray_windows.go    Windows 桌面检测、系统托盘、右键菜单与各菜单命令函数
 ├── tray_other.go      非 Windows 平台托盘占位
 ├── static/icon.ico    刺猬图标（托盘与 exe 共用）
@@ -248,6 +259,7 @@ ipscan/
 ├── exec_other.go      非 Windows 平台占位
 ├── static/index.html  前端页面（网格 + 列表 + 统计 + 导出 + 指定主机探测）
 ├── static/clip.html   网络剪贴板页面（WebRTC 直连 + 文本/文件直传 + 手动配对 + 二维码）
+├── static/player.html 播放器页面（本地音视频文件拖入/选择 + HTML5 播放；选择文件时经 console 上报文件信息到主控制台）
 └── go.mod
 ```
 

@@ -5,12 +5,12 @@ package main
 import "errors"
 
 // startMbWindow 仅 Windows 支持 miniblink 窗口，其他平台回退到默认浏览器。
-func startMbWindow(_, _, _ string, _ bool) error {
+func startMbWindow(_, _, _ string, _ bool, _ windowSize) error {
 	return errors.New("miniblink 窗口仅支持 Windows")
 }
 
 // openMbWindow 仅 Windows 支持从托盘打开内嵌内核窗口。
-func openMbWindow(_, _, _ string, _ bool) error {
+func openMbWindow(_, _, _ string, _ bool, _ windowSize) error {
 	return errors.New("miniblink 窗口仅支持 Windows")
 }
 
