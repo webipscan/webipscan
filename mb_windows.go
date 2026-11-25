@@ -29,6 +29,7 @@ const (
 	smCYScreen        = 1
 	swHide            = 0
 	swShow            = 5
+	swRestore         = 9
 
 	// mbNavigationType（mb.h）
 	mbNavLinkClick    = 0
@@ -868,6 +869,12 @@ func setMbDllDirectory(dllPath string) {
 	}
 }
 
+// setDllSearchDir 为动态库设置进程级 DLL 搜索目录，便于从同目录加载依赖。
+// 媒体直通模式不加载 mb132_x64.dll，但仍需为 libmpv 保留同样的依赖查找路径。
+func setDllSearchDir(dllPath string) {
+	setMbDllDirectory(dllPath)
+}
+
 // mbDllUsable 判断 mb132_x64.dll 是否有效：能加载且必需导出齐全
 func mbDllUsable(dllPath string) error {
 	mb := syscall.NewLazyDLL(dllPath)
@@ -922,21 +929,18 @@ func setConsoleVisible(show bool) {
 
 // prepareMbWindow 确保运行时目录下 mb132_x64.dll 存在且哈希正确，再验证其可用性；
 // 有效时返回 DLL 路径。文件缺失或哈希不符时，从内嵌 7z 资源解压覆盖。
-// hideConsole 为 true 时立刻隐藏控制台（正常窗口模式）；守护/无窗口模式传 false。
-// 无效时保留控制台、打印原因并返回空串（由调用方回退默认浏览器）。
-func prepareMbWindow(hideConsole bool) string {
+// 控制台是否显示由 --console 统一控制，本函数只负责 DLL 准备与校验。
+// 无效时打印原因并返回空串。
+func prepareMbWindow() string {
 	p, err := ensureMbDll()
 	if err != nil {
-		fmt.Println("  mb132_x64.dll 准备失败：" + err.Error() + "，改用默认浏览器")
+		fmt.Println("  mb132_x64.dll 准备失败：" + err.Error() + "，托盘菜单将回退默认浏览器")
 		return ""
 	}
 	setMbDllDirectory(p)
 	if err := mbDllUsable(p); err != nil {
-		fmt.Println("  mb132_x64.dll 不可用：" + err.Error() + "，改用默认浏览器")
+		fmt.Println("  mb132_x64.dll 不可用：" + err.Error() + "，托盘菜单将回退默认浏览器")
 		return ""
-	}
-	if hideConsole {
-		setConsoleVisible(false)
 	}
 	return p
 }
@@ -1013,14 +1017,18 @@ type mbSession struct {
 	procs    map[string]*syscall.LazyProc
 	optional func(string, ...uintptr) uintptr
 
-	viewsMu    sync.Mutex
-	views      map[uintptr]bool
-	resources  map[uintptr]*mbResourceSet
-	shortcuts  map[uintptr]*mbShortcutRegistry
-	started    bool
-	stopping   bool
-	uiThreadID uint32
-	quitTimer  *time.Timer
+	viewsMu   sync.Mutex
+	views     map[uintptr]bool
+	resources map[uintptr]*mbResourceSet
+	shortcuts map[uintptr]*mbShortcutRegistry
+	// singletonViews 记录唯一窗口的 URL -> view；hostHWNDs 记录 view -> 宿主窗口句柄，
+	// 用于在重复打开同一页面时激活原窗口而不是再开一个。
+	singletonViews map[string]uintptr
+	hostHWNDs      map[uintptr]uintptr
+	started        bool
+	stopping       bool
+	uiThreadID     uint32
+	quitTimer      *time.Timer
 
 	taskMu    sync.Mutex
 	tasks     []func()
@@ -1086,34 +1094,37 @@ func mbWindowSizeForURL(url, homeURL string, size windowSize) windowSize {
 }
 
 // ensureMbWindow 保证内核会话可用，并打开指定地址与尺寸的窗口。
+// singleton 为 true 时同一 URL 只保留一个窗口，重复打开会激活原窗口。
 // 会话的查找与创建放在同一把锁内，避免并发调用重复初始化或丢失打开请求。
-func ensureMbWindow(dllPath, url, homeURL string, allowLinks bool, size windowSize) error {
+func ensureMbWindow(dllPath, url, homeURL string, allowLinks bool, size windowSize, singleton bool) error {
 	for {
 		mbSessionMu.Lock()
 		if s := mbCurrentSession; s != nil {
 			mbSessionMu.Unlock()
 			<-s.initDone
 			if s.initErr == nil {
-				return s.open(url, allowLinks, size)
+				return s.open(url, allowLinks, size, singleton)
 			}
 			// 会话初始化失败：清理后重新判断，可能已有其他调用方重建了会话。
 			s.reset()
 			continue
 		}
 		s := &mbSession{
-			dllPath:   dllPath,
-			homeURL:   homeURL,
-			procs:     make(map[string]*syscall.LazyProc),
-			views:     make(map[uintptr]bool),
-			resources: make(map[uintptr]*mbResourceSet),
-			shortcuts: make(map[uintptr]*mbShortcutRegistry),
-			initDone:  make(chan struct{}),
+			dllPath:        dllPath,
+			homeURL:        homeURL,
+			procs:          make(map[string]*syscall.LazyProc),
+			views:          make(map[uintptr]bool),
+			resources:      make(map[uintptr]*mbResourceSet),
+			shortcuts:      make(map[uintptr]*mbShortcutRegistry),
+			singletonViews: make(map[string]uintptr),
+			hostHWNDs:      make(map[uintptr]uintptr),
+			initDone:       make(chan struct{}),
 		}
 		s.optional = s.optionalCall
 		mbCurrentSession = s
 		mbSessionMu.Unlock()
 
-		go s.run(url, allowLinks, size)
+		go s.run(url, allowLinks, size, singleton)
 		<-s.initDone
 		if s.initErr != nil {
 			err := s.initErr
@@ -1129,15 +1140,24 @@ func startMbWindow(dllPath, url, homeURL string, allowLinks bool, size windowSiz
 	if dllPath == "" {
 		return fmt.Errorf("未找到可用的 mb132_x64.dll")
 	}
-	return ensureMbWindow(dllPath, url, homeURL, allowLinks, mbWindowSizeForURL(url, homeURL, size))
+	return ensureMbWindow(dllPath, url, homeURL, allowLinks, mbWindowSizeForURL(url, homeURL, size), isAriaNgURL(url))
 }
 
 // openMbWindow 供托盘命令调用：会话不存在则启动，存在则向 UI 线程投递新窗口任务。
+// AriaNg 下载管理页始终按唯一窗口处理。
 func openMbWindow(dllPath, url, homeURL string, allowLinks bool, size windowSize) error {
 	if dllPath == "" {
 		return fmt.Errorf("未找到可用的 mb132_x64.dll")
 	}
-	return ensureMbWindow(dllPath, url, homeURL, allowLinks, mbWindowSizeForURL(url, homeURL, size))
+	return ensureMbWindow(dllPath, url, homeURL, allowLinks, mbWindowSizeForURL(url, homeURL, size), isAriaNgURL(url))
+}
+
+// openMbWindowOnce 供托盘命令调用：同一 URL 已有窗口时激活原窗口，不重复创建。
+func openMbWindowOnce(dllPath, url, homeURL string, allowLinks bool, size windowSize) error {
+	if dllPath == "" {
+		return fmt.Errorf("未找到可用的 mb132_x64.dll")
+	}
+	return ensureMbWindow(dllPath, url, homeURL, allowLinks, mbWindowSizeForURL(url, homeURL, size), true)
 }
 
 // post 把闭包投递到 miniblink UI 线程执行。
@@ -1173,8 +1193,56 @@ func (s *mbSession) postToUI(cb, view uintptr, name string) {
 	mbLogEvent("快捷键", fmt.Sprintf("当前 mb132_x64.dll 不支持线程投递，%s 未生效", name))
 }
 
-// open 在当前 UI 线程上再开一个窗口。
-func (s *mbSession) open(url string, allowLinks bool, size windowSize) error {
+// focusWindow 激活同一 URL 已存在的唯一窗口并重新载入目标页面。
+// 会话尚未启动时返回 false（非错误），由调用方继续创建窗口。
+func (s *mbSession) focusWindow(url string) (bool, error) {
+	s.viewsMu.Lock()
+	started := s.started
+	view := s.singletonViews[url]
+	s.viewsMu.Unlock()
+	if !started || view == 0 {
+		return false, nil
+	}
+
+	result := make(chan bool, 1)
+	if err := s.post(func() {
+		s.viewsMu.Lock()
+		_, exists := s.views[view]
+		hwnd := s.hostHWNDs[view]
+		s.viewsMu.Unlock()
+		alive, _, _ := procIsWindow.Call(hwnd)
+		if !exists || hwnd == 0 || alive == 0 {
+			result <- false
+			return
+		}
+		b := append([]byte(url), 0)
+		s.proc("mbLoadURL").Call(view, uintptr(unsafe.Pointer(&b[0])))
+		runtime.KeepAlive(b)
+		procShowWindowW.Call(hwnd, swRestore)
+		procSetForegroundWindow.Call(hwnd)
+		result <- true
+	}); err != nil {
+		return false, err
+	}
+	select {
+	case ok := <-result:
+		return ok, nil
+	case <-time.After(3 * time.Second):
+		return false, fmt.Errorf("激活窗口超时")
+	}
+}
+
+// open 在当前 UI 线程上再开一个窗口；singleton 为 true 时先尝试激活已有窗口。
+func (s *mbSession) open(url string, allowLinks bool, size windowSize, singleton bool) error {
+	if singleton {
+		focused, err := s.focusWindow(url)
+		if err != nil {
+			return err
+		}
+		if focused {
+			return nil
+		}
+	}
 	s.viewsMu.Lock()
 	started := s.started
 	if started {
@@ -1190,7 +1258,7 @@ func (s *mbSession) open(url string, allowLinks bool, size windowSize) error {
 	}
 
 	errCh := make(chan error, 1)
-	if err := s.post(func() { errCh <- s.createWindow(url, allowLinks, size) }); err != nil {
+	if err := s.post(func() { errCh <- s.createWindow(url, allowLinks, size, singleton) }); err != nil {
 		return err
 	}
 	select {
@@ -1202,7 +1270,7 @@ func (s *mbSession) open(url string, allowLinks bool, size windowSize) error {
 }
 
 // run 锁定单个 OS 线程完成 mbInit、创建首个窗口并驱动消息循环。
-func (s *mbSession) run(initialURL string, allowLinks bool, size windowSize) {
+func (s *mbSession) run(initialURL string, allowLinks bool, size windowSize, singleton bool) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	defer s.reset()
@@ -1265,7 +1333,7 @@ func (s *mbSession) run(initialURL string, allowLinks bool, size windowSize) {
 	})
 
 	s.setStarted(true)
-	if err := s.createWindow(initialURL, allowLinks, size); err != nil {
+	if err := s.createWindow(initialURL, allowLinks, size, singleton); err != nil {
 		s.setStarted(false)
 		s.finishInit(err)
 		return
@@ -1278,7 +1346,8 @@ func (s *mbSession) run(initialURL string, allowLinks bool, size windowSize) {
 
 // createWindow 必须在 UI 线程调用；每个窗口使用独立的快捷键注册表。
 // size 宽高有效时按其创建窗口，零值表示沿用主页默认的大窗口尺寸。
-func (s *mbSession) createWindow(url string, allowLinks bool, size windowSize) error {
+// singleton 为 true 时登记该 URL 对应的窗口，供后续重复打开时激活。
+func (s *mbSession) createWindow(url string, allowLinks bool, size windowSize, singleton bool) error {
 	w, h := size.width, size.height
 	if w <= 0 || h <= 0 {
 		w, h = 1200, 800
@@ -1376,6 +1445,15 @@ func (s *mbSession) createWindow(url string, allowLinks bool, size windowSize) e
 		go monitorMbKeys(hostHWND, shortcuts)
 		go s.watchWindow(view, hostHWND, shortcuts)
 	}
+	s.viewsMu.Lock()
+	s.hostHWNDs[view] = hostHWND
+	if singleton {
+		if old := s.singletonViews[url]; old != 0 && old != view {
+			delete(s.hostHWNDs, old)
+		}
+		s.singletonViews[url] = view
+	}
+	s.viewsMu.Unlock()
 	return nil
 }
 
@@ -1392,6 +1470,12 @@ func (s *mbSession) windowGone(view uintptr) {
 	}
 	shortcuts := s.shortcuts[view]
 	delete(s.shortcuts, view)
+	delete(s.hostHWNDs, view)
+	for u, v := range s.singletonViews {
+		if v == view {
+			delete(s.singletonViews, u)
+		}
+	}
 	s.viewsMu.Unlock()
 
 	if shortcuts != nil {

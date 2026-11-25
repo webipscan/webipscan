@@ -24,6 +24,8 @@ const (
 	mpvImageFileDLL    = 0x2000
 	mpvRPCWaitTimeout  = 5 * time.Second
 	mpvDownloadTimeout = 15 * time.Minute
+
+	aria2cDownloadUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) Gecko/20100101 Firefox/140.0"
 )
 
 // mpvRPCURL 为 aria2c RPC 地址，测试时可替换。
@@ -85,6 +87,21 @@ func mpvDataDir() string {
 	return runtimeDir
 }
 
+// mpvArchiveNameFromURL 从下载链接取带版本号的文件名，版本更新后不会复用旧压缩包。
+func mpvArchiveNameFromURL(direct string) string {
+	name := direct
+	if i := strings.LastIndex(name, "/"); i >= 0 {
+		name = name[i+1:]
+	}
+	if i := strings.IndexAny(name, "?#"); i >= 0 {
+		name = name[:i]
+	}
+	if name == "" || !strings.HasSuffix(strings.ToLower(name), ".7z") {
+		return mpvArchiveName
+	}
+	return name
+}
+
 // ensureMpvDLL 确保用户目录中存在可用的 libmpv-2.dll。
 // pageURL 为当前可用的 AriaNg 页面地址：先确保该页面的 aria2c RPC 就绪，再通过 JSON-RPC 提交下载。
 func ensureMpvDLL(pageURL string) (string, error) {
@@ -101,22 +118,39 @@ func ensureMpvDLL(pageURL string) (string, error) {
 	}
 	mpvLog("%s 缺失或不是有效的 x64 DLL，准备下载", dllPath)
 
+	archiveDir := filepath.Join(dir, ".aria2c")
+	if err := os.MkdirAll(archiveDir, 0755); err != nil {
+		return "", fmt.Errorf("创建下载目录 %s 失败：%w", archiveDir, err)
+	}
+	archiveName := mpvArchiveName
+	if len(mpvDownloadURLs) > 0 {
+		archiveName = mpvArchiveNameFromURL(mpvDownloadURLs[0])
+	}
+	archive := filepath.Join(archiveDir, archiveName)
+
+	// 已下载过的压缩包直接复用，只有解压失败或文件无效时才重新下载。
+	if st, err := os.Stat(archive); err == nil && !st.IsDir() && st.Size() > 0 {
+		mpvLog("复用已下载压缩包：%s", archive)
+		if err := extractMpvDLL(archive, dllPath); err != nil {
+			mpvLog("已有压缩包解压失败，准备重新下载：%v", err)
+		} else if !validMpvDLL(dllPath) {
+			mpvLog("已有压缩包内容无效，准备重新下载")
+		} else {
+			mpvLog("已就绪：%s", dllPath)
+			return dllPath, nil
+		}
+		// _ = os.Remove(archive)
+	}
+
 	ensureAria2cFromURL(pageURL)
 	if err := waitAria2RPC(mpvRPCWaitTimeout); err != nil {
 		return "", err
 	}
 
-	tmpDir, err := os.MkdirTemp("", "ipscan-mpv-")
-	if err != nil {
-		return "", err
-	}
-	defer os.RemoveAll(tmpDir)
-	archive := filepath.Join(tmpDir, mpvArchiveName)
-
 	var lastErr error
 	for i, u := range mpvDownloadURLs {
 		mpvLog("下载第 %d/%d 个地址：%s", i+1, len(mpvDownloadURLs), u)
-		if err := aria2cRPCDownload(u, archive, tmpDir); err != nil {
+		if err := aria2cRPCDownload(u, archive, archiveDir); err != nil {
 			lastErr = err
 			mpvLog("下载失败：%v", err)
 			continue
@@ -201,12 +235,18 @@ func waitAria2RPC(timeout time.Duration) error {
 
 // aria2cRPCDownload 通过 aria2.addUri 提交下载任务，并轮询直到完成或失败。
 func aria2cRPCDownload(downloadURL, dest, workDir string) error {
+	return aria2cRPCDownloadAs(downloadURL, dest, workDir, mpvArchiveNameFromURL(downloadURL))
+}
+
+// aria2cRPCDownloadAs 与 aria2cRPCDownload 相同，但可指定下载后的文件名。
+func aria2cRPCDownloadAs(downloadURL, dest, workDir, outName string) error {
 	_ = os.Remove(dest)
 	result, err := aria2RPC("aria2.addUri",
 		[]string{downloadURL},
 		map[string]string{
 			"dir":                workDir,
-			"out":                mpvArchiveName,
+			"out":                outName,
+			"user-agent":         aria2cDownloadUserAgent,
 			"allow-overwrite":    "true",
 			"auto-file-renaming": "false",
 			"continue":           "false",

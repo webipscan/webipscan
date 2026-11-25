@@ -14,11 +14,19 @@ func openMbWindow(_, _, _ string, _ bool, _ windowSize) error {
 	return errors.New("miniblink 窗口仅支持 Windows")
 }
 
+// openMbWindowOnce 仅 Windows 支持从托盘打开唯一内嵌内核窗口。
+func openMbWindowOnce(_, _, _ string, _ bool, _ windowSize) error {
+	return errors.New("miniblink 窗口仅支持 Windows")
+}
+
 // mbAllClosed 非 Windows 平台没有 miniblink 会话，返回永不关闭的通道。
 func mbAllClosed() <-chan struct{} { return nil }
 
 // prepareMbWindow 非 Windows 平台不存在 mb132_x64.dll 窗口模式。
-func prepareMbWindow(_ bool) string { return "" }
+func prepareMbWindow() string { return "" }
 
 // setConsoleVisible 非 Windows 平台无需处理。
 func setConsoleVisible(_ bool) {}
+
+// setDllSearchDir 非 Windows 平台无需处理 DLL 搜索目录。
+func setDllSearchDir(_ string) {}

@@ -36,13 +36,6 @@ const (
 	maxPortAttempts = 100
 )
 
-// AppVersion 文件版本，可通过构建参数注入：
-//
-//	go build -ldflags="-s -w -X main.AppVersion=1.2.3" -o ipscan.exe .
-//
-// 若 exe 带有 Windows 版本资源，则优先使用资源中的真实文件版本。
-var AppVersion = "1.0.3"
-
 // serverPort 为 listenPort 探测后实际监听的端口，供前端生成可访问的分享地址
 var serverPort string
 
@@ -181,13 +174,15 @@ func peFileVersion(path string) string {
 
 // launchOptions 启动参数
 type launchOptions struct {
-	port      string
-	noOpen    bool   // --daemon / -d / --noopen / -n：不隐藏控制台、不打开浏览器
-	noLinks   bool   // --no-links：禁止 miniblink 窗口内点击链接跳转
-	noTray    bool   // --no-tray：即使处于 Windows 桌面也不创建托盘
-	userMode  bool   // --user / --user-mode：显式声明用户模式（默认已开启，保留兼容）
-	noUser    bool   // --no-user / --no-user-mode：关闭用户模式，改回 exe 所在目录
-	targetURL string // --url：存在 mb132_x64.dll 时用 miniblink 打开该地址
+	port        string
+	showConsole bool   // --console：显示控制台窗口并输出参数说明（默认隐藏）
+	noLinks     bool   // --no-links：禁止 miniblink 窗口内点击链接跳转
+	noTray      bool   // --no-tray：即使处于 Windows 桌面也不创建托盘
+	userMode    bool   // --user / --user-mode：显式声明用户模式（默认已开启，保留兼容）
+	noUser      bool   // --no-user / --no-user-mode：关闭用户模式，改回 exe 所在目录
+	targetURL   string // --url：存在 mb132_x64.dll 时用 miniblink 打开该地址（默认不开窗）
+	mediaFile   string // 位置参数为媒体文件：用 libmpv 播放，跳过运行时独占检查
+	directURL   string // 位置参数为网页 URL：用 openWindow 打开，跳过运行时独占检查
 }
 
 // isPortNumber 判断字符串是否为合法端口数字（1-65535）。
@@ -204,6 +199,41 @@ func isPortNumber(s string) bool {
 func isExistingFile(s string) bool {
 	info, err := os.Stat(s)
 	return err == nil && !info.IsDir()
+}
+
+// mediaExtensions 是交给 libmpv 打开播放的常见音视频与图片扩展名。
+var mediaExtensions = map[string]bool{
+	".mp4": true, ".m4v": true, ".mkv": true, ".avi": true, ".mov": true, ".wmv": true,
+	".flv": true, ".webm": true, ".ts": true, ".m2ts": true, ".vob": true, ".rmvb": true,
+	".rm": true, ".mpg": true, ".mpeg": true, ".3gp": true, ".ogv": true,
+	".mp3": true, ".wav": true, ".flac": true, ".aac": true, ".m4a": true, ".ogg": true,
+	".wma": true, ".opus": true,
+	".jpg": true, ".jpeg": true, ".jfif": true, ".png": true, ".apng": true,
+	".gif": true, ".bmp": true, ".webp": true, ".tif": true, ".tiff": true,
+	".ico": true, ".avif": true, ".heic": true, ".heif": true,
+}
+
+// isMediaFile 优先识别媒体文件：扩展名命中，或文件头被检测为音视频/图片内容。
+func isMediaFile(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		return false
+	}
+	if mediaExtensions[strings.ToLower(filepath.Ext(path))] {
+		return true
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	buf := make([]byte, 512)
+	n, _ := f.Read(buf)
+	if n == 0 {
+		return false
+	}
+	ct := http.DetectContentType(buf[:n])
+	return strings.HasPrefix(ct, "video/") || strings.HasPrefix(ct, "audio/") || strings.HasPrefix(ct, "image/")
 }
 
 // detectFileType 综合扩展名与文件头部内容给出可读的文件类型描述。
@@ -244,8 +274,10 @@ func parseLaunchArgs(args []string) (launchOptions, error) {
 	for i := 0; i < len(args); i++ {
 		a := strings.TrimSpace(args[i])
 		switch {
+		case a == "--console":
+			o.showConsole = true
 		case a == "--daemon" || a == "-d" || a == "--noopen" || a == "-n":
-			o.noOpen = true
+			// 旧参数保留兼容：不打开页面已是默认行为，控制台显示只由 --console 决定。
 		case a == "--no-links":
 			o.noLinks = true
 		case a == "--no-tray":
@@ -287,17 +319,19 @@ func parseLaunchArgs(args []string) (launchOptions, error) {
 				return o, fmt.Errorf("多余的参数：%s", a)
 			}
 			positionalSeen = true
+			// 优先识别媒体文件与网页 URL，其次才是端口和普通文件。
 			switch {
+			case isMediaFile(a):
+				o.mediaFile = a
+				fmt.Printf("  位置参数识别为媒体文件（含图片），将用 libmpv 打开：%s\n", a)
+			case isHTTPURL(a):
+				o.directURL = a
+				fmt.Printf("  位置参数识别为网页 URL，将打开窗口：%s\n", a)
 			case !portSet && isPortNumber(a):
 				o.port = a // 兼容旧用法：webipscan.exe 9200
 			case isExistingFile(a):
 				fmt.Printf("  位置参数识别为文件：%s\n", a)
 				fmt.Printf("  文件类型：%s\n", detectFileType(a))
-			case isHTTPURL(a):
-				// 位置参数为 URL 时与 --url 等价，交由内置 mb 浏览器打开。
-				if o.targetURL == "" {
-					o.targetURL = a
-				}
 			default:
 				return o, fmt.Errorf("无法识别的位置参数：%s", a)
 			}
@@ -306,17 +340,89 @@ func parseLaunchArgs(args []string) (launchOptions, error) {
 	return o, nil
 }
 
+// printLaunchHelp 输出全部启动参数说明；参数错误以及带 --console 启动时都会打印。
+func printLaunchHelp() {
+	fmt.Println("用法：webipscan.exe [-p 端口] [端口|文件|URL] [--console] [--url 地址] [--no-links] [--no-tray] [--user|--user-mode] [--no-user|--no-user-mode]")
+	fmt.Println("  -p <端口> / --port <端口> / -p=<端口> / --port=<端口>  指定监听端口（1-65535），被占用时自动向上顺延")
+	fmt.Println("  [媒体文件(含图片)|网页URL|端口|文件]  位置参数优先识别：媒体文件（音视频/图片）用 libmpv 打开；网页 URL 用 openWindow 打开；两者均跳过运行时独占检查且不创建系统托盘。端口用作监听端口；其它文件仅输出类型检测")
+	fmt.Println("  --console  显示控制台窗口并输出本说明；默认隐藏控制台且不打开页面，可通过托盘菜单打开")
+	fmt.Println("  --daemon / -d / --noopen / -n  旧参数兼容，等价于默认行为（不打开页面、控制台仍默认隐藏）")
+	fmt.Println("  --url <地址> / --url=<地址>  有可用 mb132_x64.dll 时用内嵌内核窗口打开该地址（默认不开窗，仅此参数会主动开窗）")
+	fmt.Println("  --no-links  禁止 miniblink 窗口内点击链接/提交表单跳转；默认允许并在当前窗口跳转")
+	fmt.Println("  --no-tray  即使处于 Windows 桌面也不创建托盘")
+	fmt.Println("  --user / --user-mode  显式声明用户模式（默认已开启，保留兼容）")
+	fmt.Println("  --no-user / --no-user-mode  关闭用户模式，改回 exe 所在目录（环境变量 WEBIPSCAN_USER_MODE=0 同效）")
+}
+
+// openWindow 用内嵌 miniblink 窗口打开地址，内核不可用时回退系统浏览器；
+// 返回值表示是否由内嵌窗口打开，供调用方决定是否等待窗口关闭。
+func openWindow(dllPath, target, homeURL string, allowLinks bool, size windowSize) bool {
+	if dllPath != "" {
+		if err := openMbWindow(dllPath, target, homeURL, allowLinks, size); err == nil {
+			return true
+		} else {
+			fmt.Println("  内嵌内核打开窗口失败：" + err.Error() + "，改用默认浏览器")
+		}
+	}
+	if err := openBrowser(target); err != nil {
+		setConsoleVisible(true)
+		fmt.Println("  打开页面失败：" + err.Error())
+	}
+	return false
+}
+
+// openMediaFile 确保 libmpv 可用后播放媒体文件，与托盘播放器使用同一套 DLL 准备逻辑；
+// 返回值表示播放器线程是否已启动。
+func openMediaFile(file, pageURL string) bool {
+	dll, err := ensureMpvDLL(pageURL)
+	if err != nil {
+		setConsoleVisible(true)
+		fmt.Println("  libmpv-2.dll 准备失败：" + err.Error())
+		return false
+	}
+	setDllSearchDir(dll)
+	fmt.Println("  libmpv 打开：" + file)
+	if err := startMpvPlayer(dll, file); err != nil {
+		setConsoleVisible(true)
+		fmt.Println("  libmpv 播放器启动失败：" + err.Error())
+		return false
+	}
+	return true
+}
+
 func main() {
 	opts, err := parseLaunchArgs(os.Args[1:])
 	if err != nil {
 		fmt.Println("启动参数错误：" + err.Error())
-		fmt.Println("用法：webipscan.exe [-p 端口] [端口|文件|URL] [--daemon|-d|--noopen|-n] [--url 地址] [--no-links] [--no-tray] [--user|--user-mode] [--no-user|--no-user-mode]")
+		printLaunchHelp()
 		exitMain(1)
 		return
 	}
+	if opts.showConsole {
+		printLaunchHelp()
+	}
 
-	// 默认用户模式：目录为 %USERPROFILE%\<exe 文件名>，仅 --no-user 时回退 exe 目录
-	initRuntimeDir(opts.noUser && !opts.userMode)
+	// 默认用户模式：目录为 %USERPROFILE%\<exe 文件名>，仅 --no-user 时回退 exe 目录。
+	// 位置参数被判定为媒体/图片文件或网页 URL 时属于直接打开模式：跳过独占检查，也不创建系统托盘。
+	directOpen := opts.mediaFile != "" || opts.directURL != ""
+	skipInstanceLock := directOpen
+	if err := initRuntimeDir(opts.noUser && !opts.userMode, skipInstanceLock); err != nil {
+		if ae, ok := err.(*anotherInstanceError); ok {
+			fmt.Println("==============================================")
+			fmt.Println("  同一运行时目录已有主程序在运行，本次启动取消")
+			fmt.Println("  运行时目录: " + ae.dir)
+			if ae.pid > 0 {
+				fmt.Printf("  主程序 PID: %d\n", ae.pid)
+			}
+			fmt.Println("  同一运行时目录只允许运行一个主程序。")
+			fmt.Println("==============================================")
+			exitMain(1)
+			return
+		}
+		fmt.Println("运行时目录初始化失败：" + err.Error())
+		exitMain(1)
+		return
+	}
 
 	// Ctrl+C / SIGTERM 也走统一退出入口，确保关闭 aria2c 子进程
 	sigCh := make(chan os.Signal, 1)
@@ -365,15 +471,23 @@ func main() {
 	ifaces := ListLocalIfaces()
 	url := "http://127.0.0.1:" + actual
 
-	// 存在有效的 mb132_x64.dll 时提前校验；无窗口模式保留控制台，仅记录 DLL 路径
-	mbPath := prepareMbWindow(!opts.noOpen)
-	showUI := !opts.noOpen
+	// 默认隐藏控制台；--console 才保留显示。DLL 校验后仅记录路径，是否开窗由 --url 决定。
+	if !opts.showConsole {
+		setConsoleVisible(false)
+	}
+	// 仅打开媒体/图片文件时不需要 miniblink：跳过 mb132_x64.dll 的释放、加载与校验，降低内存占用。
+	// 若同时指定了 --url，仍需准备 DLL 给内嵌窗口使用。
+	mediaOnly := opts.mediaFile != "" && opts.targetURL == ""
+	mbPath := ""
+	if !mediaOnly {
+		mbPath = prepareMbWindow()
+	}
 	openURL := url
 	if opts.targetURL != "" {
 		if mbPath != "" {
 			openURL = opts.targetURL
 		} else {
-			fmt.Println("  --url 需要可用的 mb132_x64.dll，当前未找到，将使用本地页面：" + url)
+			fmt.Println("  --url 需要可用的 mb132_x64.dll，当前未找到，已忽略该地址")
 		}
 	}
 
@@ -400,23 +514,36 @@ func main() {
 		fmt.Printf("    http://%s:%s   （%s）\n", it.IP, actual, it.Kind)
 	}
 	switch {
-	case !showUI && mbPath != "" && opts.targetURL != "":
-		fmt.Println("  页面显示：miniblink 窗口打开 --url 指定地址（控制台保留）")
-	case !showUI:
-		fmt.Println("  无窗口模式：不隐藏控制台、不打开浏览器（按 Ctrl+C 停止）")
-	case mbPath != "":
-		fmt.Println("  页面显示：miniblink 窗口（控制台已隐藏），托盘常驻；无托盘时关闭所有窗口即退出")
+	case opts.mediaFile != "":
+		fmt.Println("  媒体/图片：libmpv 打开 " + opts.mediaFile)
+	case opts.directURL != "":
+		fmt.Println("  页面显示：openWindow 打开 " + opts.directURL)
+	case opts.targetURL != "" && mbPath != "":
+		fmt.Println("  页面显示：miniblink 窗口打开 --url 指定地址")
+	case opts.targetURL != "":
+		fmt.Println("  未找到可用的 mb132_x64.dll，--url 未生效")
+	case opts.showConsole:
+		fmt.Println("  后台模式：不打开页面（--console 仅显示控制台），可通过托盘菜单打开")
 	default:
-		fmt.Println("  浏览器已自动打开，按 Ctrl+C 停止")
+		fmt.Println("  后台模式：不打开页面、控制台已隐藏，可通过托盘菜单打开")
+	}
+	if skipInstanceLock {
+		fmt.Println("  直接打开模式：已跳过运行时独占检查")
+	}
+	if mediaOnly {
+		fmt.Println("  内存优化：媒体/图片直接打开模式未准备/加载 mb132_x64.dll")
+	}
+	if opts.showConsole {
+		fmt.Println("  控制台窗口：已显示（--console）")
 	}
 	if opts.targetURL != "" && mbPath != "" {
 		fmt.Println("  --url 目标：" + openURL)
 	}
 	fmt.Println("==============================================")
 
-	// Windows 桌面会话下创建系统托盘；服务会话或非 Windows 平台自动跳过
+	// Windows 桌面会话下创建系统托盘；服务会话、非 Windows 平台、--no-tray 或媒体/URL 直接打开时跳过。
 	tools := loadTools()
-	if !opts.noTray {
+	if !opts.noTray && !directOpen {
 		if startTrayIfDesktop(trayConfig{
 			homeURL:      url,
 			clipboardURL: url + "/clip.html",
@@ -425,44 +552,48 @@ func main() {
 			version:      AppVersion,
 			mbDLL:        mbPath,
 		}) {
-			fmt.Printf("  系统托盘已启用（右键菜单：主页 / 剪贴板 / aria2c")
+			fmt.Printf("  系统托盘已启用（右键菜单：主页(aria2c) / 网络占用扫描 / 剪贴板")
 			if len(tools) > 0 {
 				fmt.Printf(" / 工具(%d)", len(tools))
 			}
 			fmt.Println(" / 地址 / 控制台 / 关于 / 退出）")
 		}
+	} else if directOpen {
+		fmt.Println("  直接打开媒体/图片文件或网页 URL：不创建系统托盘")
 	}
 
 	// HTTP 服务放到后台：miniblink 消息循环运行在独立的 UI 线程上。
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- http.Serve(ln, nil) }()
 
-	// 等服务就绪后再拉起页面
+	// 等服务就绪后再拉起页面：默认不开窗，仅位置参数或 --url 显式指定时打开。
 	time.Sleep(400 * time.Millisecond)
-	mbStarted := false
-	if mbPath != "" && (showUI || opts.targetURL != "") {
-		initialSize := windowSize{}
-		if openURL != url {
-			initialSize = defaultToolWindowSize
-		}
-		if err := startMbWindow(mbPath, openURL, url, !opts.noLinks, initialSize); err != nil {
+	mbWindowStarted := false
+	if mbPath != "" && opts.targetURL != "" {
+		if err := startMbWindow(mbPath, openURL, url, !opts.noLinks, defaultToolWindowSize); err != nil {
 			// 初始化/创建窗口失败：恢复控制台让错误信息可见
 			setConsoleVisible(true)
 			fmt.Println("  miniblink 窗口启动失败：" + err.Error())
-			if showUI {
-				fmt.Println("  改用默认浏览器打开本地页面")
-			} else {
-				fmt.Println("  无窗口模式下保持服务运行")
-			}
-			openURL = url
+			fmt.Println("  服务保持运行，可通过托盘菜单打开页面")
 		} else {
-			mbStarted = true
+			mbWindowStarted = true
 		}
 	}
-	if !mbStarted && showUI {
-		if err := openBrowser(openURL); err != nil {
-			fmt.Println("  自动打开页面失败：" + err.Error())
+	if opts.directURL != "" {
+		mbWindowStarted = openWindow(mbPath, opts.directURL, url, !opts.noLinks, defaultToolWindowSize) || mbWindowStarted
+	}
+	mediaPlayerStarted := false
+	if opts.mediaFile != "" {
+		mediaPlayerStarted = openMediaFile(opts.mediaFile, url+"/AriaNg.html")
+		if mediaPlayerStarted && !mbWindowStarted {
+			waitMpvWindowsClosed()
+			fmt.Println("  播放器窗口已关闭，程序退出")
+			exitMain(0)
 		}
+	}
+	if mediaOnly && !mediaPlayerStarted {
+		fmt.Println("  媒体/图片打开失败，且未启用托盘，程序退出")
+		exitMain(1)
 	}
 
 	// 托盘命令打开的内嵌窗口与启动窗口共享会话；最后一个窗口关闭时退出。
@@ -478,10 +609,12 @@ func main() {
 	exitMain(1)
 }
 
-// exitMain 统一退出入口：先清理托盘图标，再关闭由本程序启动的 aria2c，最后退出进程。
+// exitMain 统一退出入口：先清理托盘图标，再关闭由本程序启动的 aria2c 与虚拟内网子进程，最后退出进程。
 func exitMain(code int) {
 	stopTrayIfActive()
 	shutdownAria2c()
+	shutdownEasyTierCore()
+	shutdownEasyTierWebEmbed()
 	clipShutdown()
 	os.Exit(code)
 }

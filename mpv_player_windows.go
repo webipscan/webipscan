@@ -18,6 +18,9 @@ const (
 	mpvWindowClassName = "mpv"
 	mpvWindowWaitMax   = 20 * time.Second
 	mpvWMNCDestroy     = 0x0082
+	wmKeyDown          = 0x0100
+	vkKeyQ             = 0x51
+	mpvCloseWaitMax    = 500 * time.Millisecond
 )
 
 var (
@@ -48,13 +51,13 @@ type mpvSubclass struct {
 type mpvWindowScan struct {
 	pid            uint32
 	console        uintptr
-	before         map[uintptr]bool
 	collect        map[uintptr]bool
 	skipRegistered bool
 	found          uintptr
 }
 
 // startMpvPlayer 在当前进程的新线程中用 libmpv-2.dll 打开播放文件。
+// 播放文件不存在时仍打开空播放窗口，便于用户后续拖入文件。
 // 每次调用创建独立的 mpv 实例和窗口，窗口 HWND 计入全局窗口总数。
 func startMpvPlayer(dllPath, filePath string) error {
 	if dllPath == "" {
@@ -63,30 +66,43 @@ func startMpvPlayer(dllPath, filePath string) error {
 	if _, err := os.Stat(dllPath); err != nil {
 		return fmt.Errorf("libmpv DLL 不可用：%w", err)
 	}
-	if !isExistingFile(filePath) {
-		return fmt.Errorf("播放文件不存在：%s", filePath)
-	}
 	dllAbs, err := filepath.Abs(dllPath)
 	if err != nil {
 		dllAbs = dllPath
 	}
-	fileAbs, err := filepath.Abs(filePath)
-	if err != nil {
-		fileAbs = filePath
+	fileAbs := ""
+	if isExistingFile(filePath) {
+		fileAbs, err = filepath.Abs(filePath)
+		if err != nil {
+			fileAbs = filePath
+		}
+		mpvLog("准备启动播放器线程：DLL=%s，文件=%s", dllAbs, fileAbs)
+	} else {
+		mpvLog("播放文件不存在，打开空播放窗口：%s", filePath)
 	}
-	mpvLog("准备启动播放器线程：DLL=%s，文件=%s", dllAbs, fileAbs)
 	go runMpvPlayerThread(dllAbs, fileAbs)
 	return nil
+}
+
+// waitMpvWindowsClosed 等待本进程创建的 libmpv 窗口全部关闭。
+// 位置参数为媒体文件时进程只承担播放职责，窗口关闭即可退出。
+func waitMpvWindowsClosed() {
+	deadline := time.Now().Add(mpvWindowWaitMax)
+	for extraWindowCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(100 * time.Millisecond)
+	}
+	for extraWindowCount() > 0 {
+		time.Sleep(200 * time.Millisecond)
+	}
 }
 
 // runMpvPlayerThread 完成一次播放器实例的创建、窗口绑定与生命周期跟踪。
 func runMpvPlayerThread(dllPath, filePath string) {
 	procs, h, hwnd, err := func() (map[string]*syscall.LazyProc, uintptr, uintptr, error) {
-		// 串行化启动：先快照已有窗口，再等待属于本次调用的新窗口出现。
+		// 串行化启动：等待属于本次调用的新窗口出现，跳过已登记的活动窗口。
 		mpvStartMu.Lock()
 		defer mpvStartMu.Unlock()
 
-		before := snapshotMpvWindows()
 		procs, err := loadMpvProcs(dllPath)
 		if err != nil {
 			return nil, 0, 0, err
@@ -99,7 +115,7 @@ func runMpvPlayerThread(dllPath, filePath string) {
 		deadline := time.Now().Add(mpvWindowWaitMax)
 		var hwnd uintptr
 		for time.Now().Before(deadline) && hwnd == 0 {
-			hwnd = findNewMpvWindow(before)
+			hwnd = findNewMpvWindow()
 			if hwnd == 0 {
 				time.Sleep(200 * time.Millisecond)
 			}
@@ -116,7 +132,11 @@ func runMpvPlayerThread(dllPath, filePath string) {
 		return
 	}
 	defer procs["mpv_terminate_destroy"].Call(h)
-	mpvLog("播放器窗口已打开 HWND=%d，循环播放 %s", hwnd, filePath)
+	if filePath == "" {
+		mpvLog("播放器窗口已打开 HWND=%d，空播放窗口", hwnd)
+	} else {
+		mpvLog("播放器窗口已打开 HWND=%d，循环播放 %s", hwnd, filePath)
+	}
 
 	quitCh := make(chan struct{}, 1)
 	if err := installMpvSubclass(hwnd, quitCh); err != nil {
@@ -131,22 +151,58 @@ func runMpvPlayerThread(dllPath, filePath string) {
 	for running {
 		select {
 		case <-quitCh:
-			mpvLog("收到窗口关闭按钮消息 HWND=%d，发送 quit 命令", hwnd)
+			mpvLog("收到播放器退出请求 HWND=%d，发送 quit 并关闭窗口", hwnd)
 			if err := mpvCommand(procs, h, "quit"); err != nil {
 				mpvLog("发送 quit 命令失败：%v", err)
 			}
+			closeMpvWindow(hwnd)
+			waitMpvWindowClosed(hwnd)
+			unregisterExtraWindow(hwnd)
 			running = false
 		case <-ticker.C:
 			alive, _, _ := procIsWindow.Call(hwnd)
 			vis, _, _ := procIsWindowVisible.Call(hwnd)
 			if alive == 0 || vis == 0 {
 				mpvLog("检测到播放器窗口消失或隐藏 HWND=%d alive=%d visible=%d", hwnd, alive, vis)
+				_ = mpvCommand(procs, h, "quit")
+				closeMpvWindow(hwnd)
+				waitMpvWindowClosed(hwnd)
+				unregisterExtraWindow(hwnd)
 				running = false
 			}
 		}
 	}
 	unregisterExtraWindow(hwnd)
 	mpvLog("播放器线程退出，HWND=%d", hwnd)
+}
+
+// closeMpvWindow 还原窗口过程后向窗口线程投递 WM_CLOSE。
+// mpv 内核响应 quit 时可能只结束文件而没有销毁窗口，主动关窗避免出现
+// “文件已退出、窗口仍在却无法再接收新文件”的空窗口。
+func closeMpvWindow(hwnd uintptr) {
+	if hwnd == 0 {
+		return
+	}
+	if alive, _, _ := procIsWindow.Call(hwnd); alive == 0 {
+		return
+	}
+	removeMpvSubclass(hwnd)
+	procPostMessageW.Call(hwnd, wmClose, 0, 0)
+	mpvLog("已向播放器窗口投递 WM_CLOSE HWND=%d", hwnd)
+}
+
+// waitMpvWindowClosed 等待窗口真正销毁后再注销 HWND：
+// 过早注销会让尚未销毁的旧窗口被下一次启动误认为新窗口，
+// 而销毁后不及时注销又会让复用同一 HWND 的新窗口被漏掉。
+func waitMpvWindowClosed(hwnd uintptr) {
+	deadline := time.Now().Add(mpvCloseWaitMax)
+	for time.Now().Before(deadline) {
+		if alive, _, _ := procIsWindow.Call(hwnd); alive == 0 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	mpvLog("等待播放器窗口关闭超时 HWND=%d", hwnd)
 }
 
 // installMpvSubclass 接管播放器窗口过程，用于响应关闭按钮并记录消息。
@@ -188,11 +244,16 @@ func mpvWindowProc(hwnd, msg, wParam, lParam uintptr) uintptr {
 	switch msg {
 	case wmClose:
 		mpvLog("播放器窗口事件：WM_CLOSE HWND=%d wParam=%d lParam=%d", hwnd, wParam, lParam)
-		select {
-		case sub.quit <- struct{}{}:
-		default:
-		}
+		notifyMpvQuit(sub)
 		return 0
+	case wmKeyDown:
+		// mpv 的默认 q 绑定会直接关闭内核但可能留下空窗口，这里先接管，
+		// 由播放器线程统一执行 quit、关窗和资源释放。
+		if wParam == vkKeyQ {
+			mpvLog("播放器窗口事件：按下 q HWND=%d", hwnd)
+			notifyMpvQuit(sub)
+			return 0
+		}
 	case mpvWMNCDestroy:
 		mpvLog("播放器窗口事件：WM_NCDESTROY HWND=%d", hwnd)
 		mpvSubsMu.Lock()
@@ -200,9 +261,22 @@ func mpvWindowProc(hwnd, msg, wParam, lParam uintptr) uintptr {
 			delete(mpvSubs, hwnd)
 		}
 		mpvSubsMu.Unlock()
+		// 窗口由 mpv 自行销毁（例如其内部的 quit 先生效）时也要收尾。
+		notifyMpvQuit(sub)
 	}
 	ret, _, _ := procCallWindowProcW.Call(sub.orig, hwnd, msg, wParam, lParam)
 	return ret
+}
+
+// notifyMpvQuit 把关闭请求送给播放器线程，重复消息只保留一个。
+func notifyMpvQuit(sub *mpvSubclass) {
+	if sub == nil {
+		return
+	}
+	select {
+	case sub.quit <- struct{}{}:
+	default:
+	}
 }
 
 // loadMpvProcs 从指定 DLL 读取创建播放器所需的导出函数。
@@ -236,13 +310,15 @@ func openMpvPlayer(procs map[string]*syscall.LazyProc, filePath string) (uintptr
 		}
 	}()
 
-	for _, opt := range [][2]string{
+	opts := [][2]string{
 		{"loop-file", "inf"},
-		//	{"keep-open", "yes"},
 		{"force-window", "yes"},
-		//	{"drag-and-drop", "yes"},
 		{"input-default-bindings", "yes"},
-	} {
+	}
+	if filePath == "" {
+		opts = append(opts, [2]string{"idle", "yes"})
+	}
+	for _, opt := range opts {
 		if err := mpvSetOption(procs, h, opt[0], opt[1]); err != nil {
 			return 0, err
 		}
@@ -256,10 +332,14 @@ func openMpvPlayer(procs map[string]*syscall.LazyProc, filePath string) (uintptr
 	if err := mpvCommand(procs, h, "define-key", "CLOSE_WIN", "quit"); err != nil {
 		mpvLog("define-key CLOSE_WIN 未生效：%v", err)
 	}
-	if err := mpvCommand(procs, h, "loadfile", filepath.ToSlash(filePath), "replace"); err != nil {
-		return 0, err
+	if filePath != "" {
+		if err := mpvCommand(procs, h, "loadfile", filepath.ToSlash(filePath), "replace"); err != nil {
+			return 0, err
+		}
+		mpvLog("mpv 已加载文件 handle=%d file=%s", h, filePath)
+	} else {
+		mpvLog("mpv 以空播放窗口启动 handle=%d", h)
 	}
-	mpvLog("mpv 已加载文件 handle=%d file=%s", h, filePath)
 	ready = true
 	return h, nil
 }
@@ -327,12 +407,8 @@ func mpvEnumWindowProc(hwnd, _ uintptr) uintptr {
 		scan.collect[hwnd] = true
 		return 1
 	}
-	if scan.before[hwnd] {
-		// 旧窗口可能已关闭且 HWND 被新窗口复用，仍存在的才排除。
-		if alive, _, _ := procIsWindow.Call(hwnd); alive != 0 {
-			return 1
-		}
-	}
+	// 只按“已登记的活动窗口”排除：旧窗口关闭后 HWND 可能被新窗口复用，
+	// 用启动前的 HWND 快照排除会把新窗口误判为旧窗口，导致按 q 后无法重开。
 	if scan.skipRegistered && mpvWindowRegistered(hwnd) {
 		return 1
 	}
@@ -340,13 +416,12 @@ func mpvEnumWindowProc(hwnd, _ uintptr) uintptr {
 	return 0
 }
 
-func scanMpvWindows(before, collect map[uintptr]bool, skipRegistered bool) uintptr {
+func scanMpvWindows(collect map[uintptr]bool, skipRegistered bool) uintptr {
 	mpvEnumMu.Lock()
 	defer mpvEnumMu.Unlock()
 	mpvEnumOnce.Do(func() { mpvEnumCB = syscall.NewCallback(mpvEnumWindowProc) })
 	mpvScan = mpvWindowScan{
 		pid:            uint32(mpvProcessID()),
-		before:         before,
 		collect:        collect,
 		skipRegistered: skipRegistered,
 	}
@@ -355,14 +430,8 @@ func scanMpvWindows(before, collect map[uintptr]bool, skipRegistered bool) uintp
 	return mpvScan.found
 }
 
-func snapshotMpvWindows() map[uintptr]bool {
-	windows := make(map[uintptr]bool)
-	scanMpvWindows(nil, windows, false)
-	return windows
-}
-
-func findNewMpvWindow(before map[uintptr]bool) uintptr {
-	return scanMpvWindows(before, nil, true)
+func findNewMpvWindow() uintptr {
+	return scanMpvWindows(nil, true)
 }
 
 func mpvWindowRegistered(hwnd uintptr) bool {

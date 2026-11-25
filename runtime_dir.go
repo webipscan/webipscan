@@ -15,6 +15,8 @@ var (
 	runtimeDir string
 	// runtimeUserMode 标记当前是否处于用户模式。
 	runtimeUserMode bool
+	// runtimeInstanceLock 持有 runtimeDir 的独占锁，保证同一目录只有一个主程序。
+	runtimeInstanceLock *runtimeLock
 )
 
 // dirWritable 通过在目录中创建并删除临时文件判断该目录是否可写。
@@ -54,13 +56,17 @@ func userDataRoot() (string, error) {
 	return p, nil
 }
 
-// initRuntimeDir 在解析启动参数后调用，确定运行时文件目录。
+// initRuntimeDir 在解析启动参数后调用，确定运行时文件目录，并独占该目录。
 //
 // 默认即用户模式（包括不带任何参数启动）：aria2c.exe 与 mb132_x64.dll 都从
 // %USERPROFILE%\<exe 文件名> 释放并加载，DLL 的加载目录随该路径一起切换。
 // 仅当显式指定 --no-user / --no-user-mode 或环境变量 WEBIPSCAN_USER_MODE=0 时，
 // 才回退到 exe 所在目录；用户目录不可用时同样自动回退。
-func initRuntimeDir(disableUser bool) {
+//
+// 确定目录后默认尝试独占锁：同一 runtimeDir 只允许运行一个主程序，
+// 已被占用时返回 *anotherInstanceError。skipLock 用于位置参数直接打开媒体或网页的场景，
+// 这类启动只借用目录、不占用主程序实例。锁文件无法创建时仅告警，不阻断启动。
+func initRuntimeDir(disableUser, skipLock bool) error {
 	exeDir := "."
 	if exe, err := os.Executable(); err == nil {
 		exeDir = filepath.Dir(exe)
@@ -74,12 +80,26 @@ func initRuntimeDir(disableUser bool) {
 		if p, err := userDataRoot(); err == nil {
 			if err := os.MkdirAll(p, 0755); err == nil && dirWritable(p) {
 				runtimeDir, runtimeUserMode = p, true
-				return
 			}
 		}
 	}
+	if runtimeDir == "" {
+		runtimeDir, runtimeUserMode = exeDir, false
+	}
 
-	runtimeDir, runtimeUserMode = exeDir, false
+	if skipLock {
+		return nil
+	}
+	lock, err := tryLockRuntimeDir(runtimeDir)
+	if err != nil {
+		if _, duplicate := err.(*anotherInstanceError); duplicate {
+			return err
+		}
+		fmt.Println("  警告：无法创建运行时独占锁（" + err.Error() + "），不保证同一目录仅运行一个主程序")
+		return nil
+	}
+	runtimeInstanceLock = lock
+	return nil
 }
 
 // runtimeDirLabel 返回便于打印的模式说明。

@@ -55,7 +55,7 @@ const (
 
 // 固定菜单项数量（不含分隔符）与一级菜单项上限。
 const (
-	fixedTrayMenuItems = 9
+	fixedTrayMenuItems = 12
 	maxFlatTrayItems   = 32
 )
 
@@ -70,7 +70,17 @@ const (
 	cmdTrayHideConsole
 	cmdTrayAbout
 	cmdTrayExit
+	cmdTrayEnablePlayer
+	cmdTrayEnableVirtualNet
+	cmdTrayStartVirtualNet
+	cmdTrayStartVirtualNetAdmin
+	cmdTrayPrepareSunlogin
+	cmdTrayStartSunlogin
+	cmdTrayOpenScan
 )
+
+// aria2cWindowSize 是托盘默认主页（aria2c 下载管理页面）的窗口尺寸。
+var aria2cWindowSize = windowSize{width: 512, height: 320}
 
 // tools.txt 中的工具菜单从该 ID 开始顺序分配，避免与固定命令冲突。
 const cmdTrayToolBase = 2000
@@ -218,9 +228,16 @@ func startTrayIfDesktop(cfg trayConfig) bool {
 		actions: make(map[uint32]func()),
 	}
 	app.actions[cmdTrayOpenHome] = app.commandOpenHome
+	app.actions[cmdTrayOpenScan] = app.commandOpenScan
 	app.actions[cmdTrayOpenClipboard] = app.commandOpenClipboard
 	app.actions[cmdTrayOpenAria2c] = app.commandOpenAria2c
 	app.actions[cmdTrayOpenPlayer] = app.commandOpenPlayer
+	app.actions[cmdTrayEnablePlayer] = app.commandEnablePlayer
+	app.actions[cmdTrayEnableVirtualNet] = app.commandEnableVirtualNet
+	app.actions[cmdTrayStartVirtualNet] = app.commandStartVirtualNet
+	app.actions[cmdTrayStartVirtualNetAdmin] = app.commandStartVirtualNetAdmin
+	app.actions[cmdTrayPrepareSunlogin] = app.commandPrepareSunlogin
+	app.actions[cmdTrayStartSunlogin] = app.commandStartSunlogin
 	app.actions[cmdTrayCopyAddress] = app.commandCopyAddress
 	app.actions[cmdTrayShowConsole] = app.commandShowConsole
 	app.actions[cmdTrayHideConsole] = app.commandHideConsole
@@ -433,7 +450,7 @@ func (a *trayApp) wndProc(hwnd, msg, wParam, lParam uintptr) uintptr {
 		// 直接等待 WM_RBUTTONUP 永远不会收到。
 		switch uint32(lParam) {
 		case wmRButtonUp:
-			a.showMenu()
+			a.showMenu(ctrlKeyHeld())
 		case wmLButtonDbl:
 			if fn := a.actions[cmdTrayOpenHome]; fn != nil {
 				safeTrayCall(fn)
@@ -453,7 +470,13 @@ func safeTrayCall(fn func()) {
 	fn()
 }
 
-func (a *trayApp) showMenu() {
+// ctrlKeyHeld 在构建托盘菜单的瞬间检测 Ctrl 是否按住。
+// 复用 mb_windows.go 的 GetAsyncKeyState 封装，避免重复声明虚拟键码与按键状态位。
+func ctrlKeyHeld() bool {
+	return mbKeyDown(vkControl)
+}
+
+func (a *trayApp) showMenu(ctrlHeld bool) {
 	hMenu, _, _ := procCreatePopupMenu.Call()
 	if hMenu == 0 {
 		return
@@ -469,7 +492,7 @@ func (a *trayApp) showMenu() {
 		runtime.KeepAlive(p)
 	}
 
-	appendItem(cmdTrayOpenHome, "打开主页")
+	appendItem(cmdTrayOpenHome, "打开主页（aria2c 下载管理）")
 	if len(a.cfg.tools) > 0 {
 		if fixedTrayMenuItems+len(a.cfg.tools) < maxFlatTrayItems {
 			// 菜单项不多时直接平铺，减少一次子菜单操作。
@@ -492,16 +515,39 @@ func (a *trayApp) showMenu() {
 	}
 
 	procAppendMenuW.Call(hMenu, mfSeparator, 0, 0)
+	appendItem(cmdTrayOpenScan, "网络占用扫描")
 	appendItem(cmdTrayOpenClipboard, "打开网络剪贴板")
-	appendItem(cmdTrayOpenAria2c, "打开 aria2c 页面")
-	appendItem(cmdTrayOpenPlayer, "播放器")
+	if validMpvDLL(filepath.Join(mpvDataDir(), mpvDllName)) {
+		appendItem(cmdTrayOpenPlayer, "启动播放器")
+	} else {
+		appendItem(cmdTrayEnablePlayer, "准备播放器")
+	}
 
+	// 暂关虚拟内网
+	// if easytierInstalled(easytierDataDir()) {
+	// 	appendItem(cmdTrayStartVirtualNet, "启动虚拟内网")
+	// } else {
+	// 	appendItem(cmdTrayEnableVirtualNet, "准备虚拟内网")
+	// }
+	// appendItem(cmdTrayStartVirtualNetAdmin, "启动虚拟网管理")
+
+	if sunloginInstalled(sunloginDataDir()) {
+		appendItem(cmdTrayStartSunlogin, "启动向日葵SOS")
+	} else {
+		appendItem(cmdTrayPrepareSunlogin, "准备向日葵SOS")
+	}
+
+	// 显示控制台 / 隐藏控制台 / 复制访问地址属于低频操作，仅在 Ctrl + 右键时显示。
+	// 连同两侧分隔符一起控制，避免普通右键菜单出现空分隔符。
+	if ctrlHeld {
+		procAppendMenuW.Call(hMenu, mfSeparator, 0, 0)
+		appendItem(cmdTrayShowConsole, "显示控制台")
+		appendItem(cmdTrayHideConsole, "隐藏控制台")
+		appendItem(cmdTrayCopyAddress, "复制访问地址")
+		procAppendMenuW.Call(hMenu, mfSeparator, 0, 0)
+	}
 	procAppendMenuW.Call(hMenu, mfSeparator, 0, 0)
-	appendItem(cmdTrayShowConsole, "显示控制台")
-	appendItem(cmdTrayHideConsole, "隐藏控制台")
-	appendItem(cmdTrayCopyAddress, "复制访问地址")
-	procAppendMenuW.Call(hMenu, mfSeparator, 0, 0)
-	appendItem(cmdTrayAbout, "关于 ipscan")
+	appendItem(cmdTrayAbout, "关于 webipscan")
 	appendItem(cmdTrayExit, "退出")
 
 	var pt trayPoint
@@ -513,11 +559,22 @@ func (a *trayApp) showMenu() {
 
 // 以下是各菜单项对应的独立命令函数。
 
+type mbWindowOpener func(dllPath, url, homeURL string, allowLinks bool, size windowSize) error
+
 // openWindow 用内嵌 miniblink 窗口打开地址；内核不可用时回退系统浏览器。
 // size 为零值表示主页的大窗口，其他窗口由调用方传入配置尺寸或 800x600。
 func (a *trayApp) openWindow(url string, size windowSize) {
+	a.openWindowWith(url, size, openMbWindow)
+}
+
+// openWindowOnce 打开唯一窗口：同一地址已有窗口时激活原窗口而不重复创建。
+func (a *trayApp) openWindowOnce(url string, size windowSize) {
+	a.openWindowWith(url, size, openMbWindowOnce)
+}
+
+func (a *trayApp) openWindowWith(url string, size windowSize, opener mbWindowOpener) {
 	if a.cfg.mbDLL != "" {
-		if err := openMbWindow(a.cfg.mbDLL, url, a.cfg.homeURL, true, size); err == nil {
+		if err := opener(a.cfg.mbDLL, url, a.cfg.homeURL, true, size); err == nil {
 			return
 		} else {
 			fmt.Println("  内嵌内核打开窗口失败：" + err.Error() + "，改用默认浏览器")
@@ -538,15 +595,21 @@ func (a *trayApp) openTool(t toolEntry) {
 	}
 }
 
-func (a *trayApp) commandOpenHome() { a.openWindow(a.cfg.homeURL, windowSize{}) }
+// commandOpenHome 托盘默认主页：aria2c 下载管理页面（512x320，唯一窗口）。
+func (a *trayApp) commandOpenHome() { a.commandOpenAria2c() }
+
+// commandOpenScan 打开网络占用扫描页面（/index.html）。
+func (a *trayApp) commandOpenScan() {
+	a.openWindow(a.cfg.homeURL+"/index.html", defaultToolWindowSize)
+}
 
 func (a *trayApp) commandOpenClipboard() { a.openWindow(a.cfg.clipboardURL, defaultToolWindowSize) }
 
-// commandOpenAria2c 先确保 aria2c RPC 就绪，再打开 AriaNg 页面。
+// commandOpenAria2c 先确保 aria2c RPC 就绪，再以唯一窗口打开 AriaNg 页面。
 func (a *trayApp) commandOpenAria2c() {
 	go func() {
 		ensureAria2cFromURL(a.cfg.aria2cURL)
-		a.openWindow(a.cfg.aria2cURL, defaultToolWindowSize)
+		a.openWindowOnce(a.cfg.aria2cURL, aria2cWindowSize)
 	}()
 }
 
@@ -554,17 +617,95 @@ func (a *trayApp) commandOpenAria2c() {
 func (a *trayApp) commandOpenPlayer() {
 	go func() {
 		demo := filepath.Join(mpvDataDir(), "demo.mp4")
-		if !isExistingFile(demo) {
-			return
-		}
 		dll, err := ensureMpvDLL(a.cfg.aria2cURL)
 		if err != nil {
 			fmt.Println("  libmpv-2.dll 准备失败：" + err.Error())
 			return
 		}
-		fmt.Println("  播放器启动：" + dll + ",文件	" + demo)
+		if isExistingFile(demo) {
+			fmt.Println("  播放器启动：" + dll + ",文件	" + demo)
+		} else {
+			fmt.Println("  播放器启动：" + dll + ",未找到 demo.mp4，打开空播放窗口")
+		}
 		if err := startMpvPlayer(dll, demo); err != nil {
 			fmt.Println("  libmpv 播放器启动失败：" + err.Error())
+		}
+	}()
+}
+
+// commandEnablePlayer 下载并解压 libmpv-2.dll 到用户目录；菜单每次弹出时重新判断，
+// 成功后下次打开托盘菜单即显示为“播放器”。
+func (a *trayApp) commandEnablePlayer() {
+	go func() {
+		dll, err := ensureMpvDLL(a.cfg.aria2cURL)
+		if err != nil {
+			fmt.Println("  开启播放器失败：" + err.Error())
+			return
+		}
+		fmt.Println("  播放器已开启：" + dll)
+	}()
+}
+
+// commandEnableVirtualNet 从官网下载页解析 CLI 链接，下载解压 easytier-core.exe 到用户目录；
+// 成功后下次打开托盘菜单即显示为“启动虚拟内网”。
+func (a *trayApp) commandEnableVirtualNet() {
+	go func() {
+		exe, err := ensureEasyTierCore(a.cfg.aria2cURL)
+		if err != nil {
+			fmt.Println("  开启虚拟内网失败：" + err.Error())
+			return
+		}
+		fmt.Println("  虚拟内网已就绪：" + exe)
+	}()
+}
+
+// commandStartVirtualNet 启动虚拟内网：先确认 easytier-core.conf 存在，
+// 前置启动 easytier-web-embed.exe 后，以用户目录 webipscan 为主目录启动 easytier-core.exe。
+func (a *trayApp) commandStartVirtualNet() {
+	go func() {
+		if err := ensureEasyTierCoreFromConfig(a.cfg.aria2cURL); err != nil {
+			fmt.Println("  虚拟内网启动失败：" + err.Error())
+		}
+	}()
+}
+
+// commandStartVirtualNetAdmin 确保 easytier-web-embed.exe 已启动，
+// 再用内嵌 MB 窗口打开 Web 控制台 http://localhost:11211/。
+func (a *trayApp) commandStartVirtualNetAdmin() {
+	go func() {
+		if err := ensureEasyTierWebEmbedFromURL(a.cfg.aria2cURL); err != nil {
+			fmt.Println("  虚拟网管理启动失败：" + err.Error())
+			return
+		}
+		if err := waitEasyTierWebReady(5 * time.Second); err != nil {
+			fmt.Println("  Web 控制台尚未就绪：" + err.Error())
+		}
+		a.openWindowOnce(easytierWebAdminURL, defaultToolWindowSize)
+	}()
+}
+
+// commandPrepareSunlogin 通过 aria2c 下载向日葵 SOS 到用户目录的 .aria2c 并复制到用户目录；
+// 成功后下次打开托盘菜单即显示为“启动向日葵SOS”。
+func (a *trayApp) commandPrepareSunlogin() {
+	go func() {
+		exe, err := ensureSunloginSOS(a.cfg.aria2cURL)
+		if err != nil {
+			fmt.Println("  准备向日葵SOS失败：" + err.Error())
+			return
+		}
+		fmt.Println("  向日葵SOS已就绪：" + exe)
+	}()
+}
+
+// commandStartSunlogin 启动用户目录中的向日葵 SOS。
+func (a *trayApp) commandStartSunlogin() {
+	go func() {
+		dir := sunloginDataDir()
+		if !sunloginInstalled(dir) {
+			return
+		}
+		if err := startSunloginSOS(filepath.Join(dir, sunloginExeName)); err != nil {
+			fmt.Println("  向日葵SOS启动失败：" + err.Error())
 		}
 	}()
 }
@@ -580,9 +721,13 @@ func (a *trayApp) commandAbout() {
 	if err != nil {
 		exe = "(未知路径)"
 	}
-	text := fmt.Sprintf("ipscan %s\n\n地址：%s\n程序：%s", a.cfg.version, a.cfg.homeURL, exe)
+	// text := fmt.Sprintf("ipscan %s\n\n地址：%s\n程序：%s", a.cfg.version, a.cfg.homeURL, exe)
+	text := fmt.Sprintf("webipscan by taosir %s\n程序：%s", a.cfg.version, exe)
 	t, _ := syscall.UTF16PtrFromString(text)
-	c, _ := syscall.UTF16PtrFromString("关于 ipscan")
+	// c 是 MessageBoxW 的 lpCaption（第三个参数），即“关于”对话框的标题栏文字。
+	// UTF16PtrFromString 把 Go 字符串转为以 NUL 结尾的 UTF-16 缓冲区，供 Win32 MessageBoxW 使用；
+	// 标题固定为 "webipscan by taosir "（末尾带空格），与正文 t（版本、程序路径）区分。
+	c, _ := syscall.UTF16PtrFromString("关于")
 	procMessageBoxW.Call(0, uintptr(unsafe.Pointer(t)), uintptr(unsafe.Pointer(c)), mbIconInformation)
 	runtime.KeepAlive(t)
 	runtime.KeepAlive(c)
